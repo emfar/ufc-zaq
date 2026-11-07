@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Deploys UFC ZAQ on the server. GitHub Actions runs it over SSH as the deploy
-# user in /opt/ufc-zaq, next to docker-compose.yml, Caddyfile and app_password:
+# Deploys zufc (UFC ZAQ) on the shared server. GitHub Actions runs it over SSH as
+# the zufc user in /opt/zufc, next to docker-compose.yml and app_password:
 #
-#   DOMAIN=ufc.example.com bash remote-deploy.sh ghcr.io/owner/ufc-zaq:sha-1a2b3c4
+#   DOMAIN=zufc.example.com bash remote-deploy.sh ghcr.io/owner/ufc-zaq:sha-1a2b3c4
 #
+# HTTPS comes from the server's existing Caddy container (the one publishing port
+# 443), which reaches the app as zufc-app:3000 over the shared "edge" network that
+# deploy/server-setup.sh sets up. DOMAIN is only used to check that routing.
 # Optional settings: APP_NAME, TIMEZONE, PLAYERS, SESSION_DAYS (empty = the app's
 # default). A setting that is not passed at all keeps its current value.
 #
-# It writes .env, pulls the image, backs up the database, restarts the stack and
-# waits for the app to report healthy. If it does not, it prints the app's logs,
-# puts the previous .env (image and settings) back, restarts that and exits 1.
+# It writes .env, pulls the image, backs up the database, restarts the app and
+# waits for it to report healthy. If it does not, it prints the app's logs, puts
+# the previous .env (image and settings) back, restarts that and exits 1.
 # SKIP_PULL=1 uses images already on this machine and leaves them all in place
 # (for tests, or a manual rollback here: SKIP_PULL=1 bash remote-deploy.sh <image
 # shown as "previous" in the last deploy log>). HEALTH_TIMEOUT=<seconds> (90).
@@ -19,6 +22,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 image=${1:?usage: remote-deploy.sh <image>}
 health_timeout=${HEALTH_TIMEOUT:-90}
+domain=${DOMAIN:-}
+network=edge
+service=zufc-app # must match docker-compose.yml
 keep_backups=20
 env_file=.env.new
 
@@ -43,7 +49,7 @@ wait_healthy() {
   local id state="" deadline=$((SECONDS + health_timeout))
   log "Waiting up to ${health_timeout}s for the app to report healthy"
   while ((SECONDS < deadline)); do
-    id=$(compose ps --all --quiet app)
+    id=$(compose ps --all --quiet "$service")
     state=$(docker inspect --format \
       '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}} {{.RestartCount}}' "$id" 2> /dev/null) ||
       state="missing 0"
@@ -58,9 +64,30 @@ wait_healthy() {
   return 1
 }
 
+# The shared Caddy must be on the edge network to reach zufc-app. If its own
+# stack recreated the container without it, attach it again (harmless otherwise).
+check_caddy() {
+  local caddy
+  caddy=$(docker ps --filter publish=443 --format '{{.Names}}' | head -n 1)
+  if [[ -z $caddy ]]; then
+    log "WARNING: no container publishes port 443, so the server's Caddy is not running and ${domain:-the site} won't load"
+    return 0
+  fi
+  if ! docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$caddy" |
+    grep -qxF "$network"; then
+    log "Connecting $caddy to the $network network"
+    docker network connect "$network" "$caddy" || log "WARNING: could not connect $caddy to $network"
+  fi
+  if [[ -n $domain ]] && ! docker exec "$caddy" cat /etc/caddy/Caddyfile 2> /dev/null | grep -qF "$domain"; then
+    log "WARNING: $caddy's Caddyfile has no $domain site. Run deploy/server-setup.sh on the server again."
+  fi
+}
+
 exec 9> .deploy.lock
 flock --wait 600 9 || die "another deploy is still running"
 docker compose version > /dev/null 2>&1 || die "docker compose does not work for $(id -un) (see deploy/server-setup.sh)"
+docker network inspect "$network" > /dev/null 2>&1 ||
+  die "the Docker network '$network' is missing: run deploy/server-setup.sh on the server"
 [[ -s app_password ]] || die "app_password is missing (the GitHub Actions deploy writes it)"
 # The app runs as uid 1000 in its container and reads this file through the
 # compose secret; the directory (mode 700) keeps everyone else on the server out.
@@ -68,11 +95,9 @@ chmod 644 app_password
 
 [[ $health_timeout =~ ^[0-9]+$ ]] || die "HEALTH_TIMEOUT must be a number of seconds"
 [[ $image =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]] || die "not an image reference: $image"
-domain=${DOMAIN-$(current DOMAIN)}
-[[ $domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "DOMAIN must be a host name such as ufc.example.com"
+[[ -z $domain || $domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "DOMAIN must be a host name"
 new_env=$(
   env_line APP_IMAGE "$image"
-  env_line DOMAIN "$domain"
   for name in APP_NAME TIMEZONE PLAYERS SESSION_DAYS; do
     if [[ -v $name ]]; then value=${!name}; else value=$(current "$name"); fi
     env_line "$name" "$value"
@@ -80,7 +105,7 @@ new_env=$(
 )
 # Compose prefers variables from its environment over the env file: drop them,
 # so that .env alone decides (also during a rollback).
-unset APP_IMAGE DOMAIN APP_NAME TIMEZONE PLAYERS SESSION_DAYS
+unset APP_IMAGE APP_NAME TIMEZONE PLAYERS SESSION_DAYS
 
 previous_env=$(cat .env 2> /dev/null || true)
 previous_image=$(current APP_IMAGE)
@@ -92,18 +117,14 @@ if [[ ${SKIP_PULL:-} == 1 ]]; then
   log "SKIP_PULL=1: using local images"
 else
   log "Pulling $image"
-  compose pull --quiet app || die "could not pull $image - nothing was changed"
-  compose pull --quiet caddy || log "WARNING: could not update caddy:2, keeping the local copy"
-fi
-if ! out=$(compose run --rm --no-deps -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 < /dev/null); then
-  printf '%s\n' "$out" >&2
-  die "the Caddyfile check failed - nothing was changed"
+  compose pull --quiet "$service" || die "could not pull $image - nothing was changed"
 fi
 
-if [[ -n $(compose ps --quiet --status running app) ]]; then
+if [[ -n $(compose ps --quiet --status running "$service") ]]; then
   log "Backing up the database"
-  compose exec -T app node scripts/backup.js < /dev/null || die "the database backup failed - nothing was changed"
-  compose exec -T app sh -c "ls -1t /app/data/backups/ufc-*.db | tail -n +$((keep_backups + 1)) | xargs -r rm -f --" < /dev/null
+  compose exec -T "$service" node scripts/backup.js < /dev/null || die "the database backup failed - nothing was changed"
+  compose exec -T "$service" sh -c "ls -1t /app/data/backups/ufc-*.db | tail -n +$((keep_backups + 1)) | xargs -r rm -f --" < /dev/null ||
+    log "WARNING: could not delete old backups (keeping all of them)"
 else
   log "The app is not running yet: no backup to take"
 fi
@@ -111,24 +132,24 @@ fi
 mv -f .env.new .env
 env_file=.env
 log "Starting $image"
-# --force-recreate: compose cannot see a new app_password or Caddyfile by itself.
+# --force-recreate: compose cannot see a new app_password by itself.
 if compose up --detach --remove-orphans --force-recreate && wait_healthy; then
   log "Deployed $image (previous: ${previous_image:-none})"
+  check_caddy
   # Free disk space: older pulled tags of this image (the previous one stays for
-  # a quick rollback), then dangling layers.
+  # a quick rollback). Other projects' images on this server are left alone.
   if [[ ${SKIP_PULL:-} != 1 ]]; then
     repo=${image%@*}
     [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
     docker image ls --format '{{.Repository}}:{{.Tag}}' "$repo" | grep -vxF -e "$image" -e "${previous_image:-$image}" |
       xargs -r docker image rm > /dev/null 2>&1 || true
   fi
-  docker image prune --force > /dev/null || true
   compose ps
   exit 0
 fi
 
 log "The deploy failed. Last app log lines:"
-compose logs --no-color --tail 100 app || true
+compose logs --no-color --tail 100 "$service" || true
 if [[ -z $previous_env || $previous_env == "$new_env" ]]; then
   die "deploy of $image failed, and there is no other version to roll back to"
 fi

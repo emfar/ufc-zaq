@@ -35,37 +35,77 @@ Changing it logs every phone out, so it's also how you kick everyone out.
 Running the app without a password configured (e.g. on your computer) makes it
 generate one on first start and print it in the log.
 
-## Deployment: GitHub Actions → your server
+## Deployment: GitHub Actions → the shared server
 
 Every push to the repository's default branch runs the checks, builds a Docker
-image (stored privately in GitHub's container registry), and deploys it to the
-server over SSH. The server runs the app plus [Caddy](https://caddyserver.com),
-which gets and renews the HTTPS certificate on its own. Before each deploy the
-database is backed up on the server (the newest 20 backups are kept), and if
-the new version doesn't come up healthy it's rolled back automatically.
-Pull requests and other branches only run the checks.
+image (stored privately in GitHub's container registry) and deploys it to the
+server over SSH. Before each deploy the database is backed up on the server
+(the newest 20 backups are kept); if the new version doesn't come up healthy,
+the previous one is put back automatically. Pull requests and other branches
+only run the checks.
+
+**How it fits on the server.** The server is shared (asaim-main, asaim-test,
+later asaim-learn, and zufc). HTTPS for all of them is handled by the one Caddy
+container of the `fincert-asm` stack (`fincert-asm-caddy-1`, ports 80/443).
+zufc runs only its app container, in `/opt/zufc`, with no ports of its own; the
+Caddy reaches it as `zufc-app:3000` over a shared Docker network called `edge`.
+The zufc container can't see the other projects' private networks (their
+databases).
+
+> Anything that joins `edge` must use a **unique service name** (like
+> `zufc-app`): every name on `edge` is visible to Caddy, so a second service
+> called `app` would hijack routes such as `reverse_proxy app:8000`.
 
 ### One-time setup
 
-1. **DNS:** point `zufc.asaim.tech` (an **A** record) at `94.20.57.239`.
+1. **DNS:** `zufc.asaim.tech` → `94.20.57.239` (an **A** record). ✔ done.
 2. **Server:** log in as root over SSH and paste the contents of
-   [`deploy/server-setup.sh`](deploy/server-setup.sh). It installs Docker,
-   creates a `deploy` user for GitHub Actions, opens ports 80/443 if a firewall
-   is on, and prints two values: `SSH_PRIVATE_KEY` and `SSH_KNOWN_HOSTS`.
-   It's safe to run again.
+   [`deploy/server-setup.sh`](deploy/server-setup.sh). It creates the `zufc`
+   user (SSH key only) and `/opt/zufc`, creates the `edge` network and attaches
+   the Caddy to it, adds the `zufc.asaim.tech` site to that Caddy's Caddyfile —
+   validated first, the original kept as `Caddyfile.before-zufc` — and reloads
+   Caddy without downtime. It prints `SSH_PRIVATE_KEY` and `SSH_KNOWN_HOSTS`.
+   Safe to run again.
 3. **GitHub:** repo → *Settings* → *Secrets and variables* → *Actions* →
    *New repository secret*, three times:
    - `SSH_PRIVATE_KEY` — from step 2
    - `SSH_KNOWN_HOSTS` — from step 2
    - `APP_PASSWORD` — the club password you choose (at least 8 characters)
-4. **Deploy:** *Actions* → *CI/CD* → *Run workflow* (or push a commit).
-   Then open `https://zufc.asaim.tech`.
+4. **Deploy:** *Actions* → *CI/CD* → *Run workflow* (or push a commit), then
+   open `https://zufc.asaim.tech`.
+5. **Keep it in the fincert-asm repo** so asaim deploys don't undo step 2.
+   Add the site to its Caddyfile:
+
+   ```
+   zufc.asaim.tech {
+   	encode zstd gzip
+   	reverse_proxy zufc-app:3000
+   }
+   ```
+
+   and put its `caddy` service on the shared network in its compose file
+   (keep `default` so asaim keeps working):
+
+   ```yaml
+   services:
+     caddy:
+       networks:
+         - default
+         - edge
+
+   networks:
+     edge:
+       external: true
+   ```
+
+   Until then every zufc deploy re-attaches the Caddy to `edge` if needed and
+   warns if the site is missing from the Caddyfile (re-run step 2 to add it).
 
 ### Everyday use
 
 - **Ship a change:** push to the default branch.
 - **Change the club password:** update the `APP_PASSWORD` secret, then
-  *Actions* → *CI/CD* → *Run workflow*.
+  *Actions* → *CI/CD* → *Run workflow*. Every phone is logged out.
 - **Roll back:** *Actions* → *CI/CD* → *Run workflow* and enter an older image
   tag such as `sha-1a2b3c4` (each run's summary shows its tag).
 
@@ -76,9 +116,9 @@ Optional repository **variables** (*Settings* → *Secrets and variables* →
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DOMAIN` | `zufc.asaim.tech` | The address the app is served on |
+| `DOMAIN` | `zufc.asaim.tech` | The address the app is served on (also change it in the Caddyfile) |
 | `SSH_HOST` | `94.20.57.239` | Server to deploy to |
-| `SSH_USER` | `deploy` | SSH user created by the setup script |
+| `SSH_USER` | `zufc` | SSH user created by the setup script |
 | `SSH_PORT` | `22` | SSH port |
 | `APP_NAME` | `UFC ZAQ` | Name in the header, login screen and home-screen icon |
 | `TIMEZONE` | `Asia/Baku` | Months start and end at midnight in this time zone |
@@ -86,12 +126,12 @@ Optional repository **variables** (*Settings* → *Secrets and variables* →
 
 ### On the server
 
-Everything lives in `/opt/ufc-zaq`; the data is in the `app-data` Docker volume.
+Everything lives in `/opt/zufc`; the data is in the `zufc_app-data` Docker volume.
 
 ```bash
-cd /opt/ufc-zaq && docker compose logs --tail 50 app       # app log
-docker compose exec app node scripts/backup.js             # extra backup
-docker compose cp app:/app/data/backups ./backups          # copy backups out
+cd /opt/zufc && docker compose logs --tail 50 zufc-app      # app log
+docker compose exec zufc-app node scripts/backup.js         # extra backup
+docker compose cp zufc-app:/app/data/backups ./backups      # copy backups out
 ```
 
 ## Run it on your computer
@@ -118,6 +158,6 @@ src/                 server: config, database, login, scoring rules, API
 public/              the mobile web app (HTML, CSS, JS modules, icons, font)
 scripts/backup.js    consistent database backup
 test/                node:test suites — `npm test`
-deploy/              server setup, deploy script, production docker compose + Caddyfile
+deploy/              server setup, deploy script, production docker compose
 .github/workflows/   CI/CD
 ```

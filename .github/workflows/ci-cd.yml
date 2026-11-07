@@ -166,7 +166,7 @@ jobs:
       # Repository variables (Settings > Secrets and variables > Actions > Variables) override these defaults.
       # Secrets needed: SSH_PRIVATE_KEY and SSH_KNOWN_HOSTS (printed by deploy/server-setup.sh), APP_PASSWORD.
       SSH_HOST: ${{ vars.SSH_HOST || '94.20.57.239' }}
-      SSH_USER: ${{ vars.SSH_USER || 'deploy' }}
+      SSH_USER: ${{ vars.SSH_USER || 'zufc' }}
       SSH_PORT: ${{ vars.SSH_PORT || '22' }}
       DOMAIN: ${{ vars.DOMAIN || 'zufc.asaim.tech' }}
       APP_NAME: ${{ vars.APP_NAME }}
@@ -272,7 +272,7 @@ jobs:
         run: |
           if ! docker manifest inspect "$IMAGE_REF" > /dev/null; then
             packages="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pkgs/container/${GITHUB_REPOSITORY#*/}"
-            echo "::error title=Image not found::$IMAGE_REF does not exist. Only pushes to the default branch publish images; for a rollback pick a sha-... tag from $packages"
+            echo "::error title=Image not found::Cannot read $IMAGE_REF (docker's error is above). Only pushes to the default branch publish images; for a rollback pick an existing sha-... tag from $packages"
             exit 1
           fi
 
@@ -317,12 +317,12 @@ jobs:
 
       # Everything goes to the server over stdin (no scp/sftp), so the "restrict"
       # option on the deploy key in authorized_keys keeps working.
-      - name: Upload docker-compose.yml, Caddyfile and remote-deploy.sh
+      - name: Upload docker-compose.yml and remote-deploy.sh
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          tar -C deploy -cf - docker-compose.yml Caddyfile remote-deploy.sh |
+          tar -C deploy -cf - docker-compose.yml remote-deploy.sh |
             ssh -F "$SSH_CONFIG" server 'set -e
-              cd /opt/ufc-zaq 2> /dev/null || { echo "/opt/ufc-zaq is missing: run deploy/server-setup.sh on the server" >&2; exit 1; }
+              cd /opt/zufc 2> /dev/null || { echo "/opt/zufc is missing: run deploy/server-setup.sh on the server" >&2; exit 1; }
               rm -rf .upload && mkdir .upload && tar -xf - -C .upload
               chmod 644 .upload/* && mv -f .upload/* . && rmdir .upload'
 
@@ -333,11 +333,11 @@ jobs:
         run: |
           # Only stdin carries the password: it is never in a command line, an environment or a log.
           # Mode 644 lets the app (uid 1000 in its container) read it through the compose secret,
-          # while /opt/ufc-zaq itself (mode 700) keeps other users on the server out.
+          # while /opt/zufc itself (mode 700) keeps other users on the server out.
           pw=$APP_PASSWORD
           while [[ $pw == *[$'\r\n'] ]]; do pw=${pw%?}; done
           printf '%s\n' "$pw" | ssh -F "$SSH_CONFIG" server \
-            'cd /opt/ufc-zaq && umask 077 && cat > .app_password.new && chmod 644 .app_password.new && mv -f .app_password.new app_password'
+            'cd /opt/zufc && umask 077 && cat > .app_password.new && chmod 644 .app_password.new && mv -f .app_password.new app_password'
 
       - name: Log in to ghcr.io on the server
         id: login
@@ -352,7 +352,7 @@ jobs:
       - name: Deploy
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          remote="cd /opt/ufc-zaq &&"
+          remote="cd /opt/zufc &&"
           for name in DOMAIN APP_NAME TIMEZONE PLAYERS SESSION_DAYS; do
             remote+=" $name=$(printf %q "${!name}")"
           done
@@ -384,8 +384,10 @@ jobs:
                   echo "TCP $port: not reachable"
                 fi
               done
-              echo "Containers and the last Caddy log lines:"
-              ssh -F "$SSH_CONFIG" server 'cd /opt/ufc-zaq && docker compose ps && docker compose logs --no-color --tail 40 caddy' || true
+              echo "zufc and the last log lines of the server's Caddy (the container publishing port 443):"
+              ssh -F "$SSH_CONFIG" server 'cd /opt/zufc && docker compose ps
+                caddy=$(docker ps --filter publish=443 --format "{{.Names}}" | head -n 1)
+                [ -n "$caddy" ] && docker logs --tail 40 "$caddy" 2>&1' || true
               exit 1
             fi
             sleep 5
