@@ -1,7 +1,7 @@
 'use strict';
 
 const { createApp } = require('./app');
-const { generatePassword, hashPasswordSync } = require('./auth');
+const { applyLoginPassword } = require('./auth');
 const { loadConfig } = require('./config');
 const { openDatabase, syncPlayers } = require('./db');
 
@@ -10,17 +10,17 @@ const log = {
   error: (err) => console.error(`${new Date().toISOString()}`, err),
 };
 
-function printInitialPasswords(created) {
-  const width = Math.max(...created.map((c) => c.name.length));
+function printGeneratedPassword(password) {
   console.log('');
   console.log('==================================================');
-  console.log(' New players created. Their first passwords:');
+  console.log(' No APP_PASSWORD is set, so one was generated.');
+  console.log(' Everyone logs in with:');
   console.log('');
-  for (const { name, password } of created) console.log(`   ${name.padEnd(width)}   ${password}`);
+  console.log(`     ${password}`);
   console.log('');
-  console.log(' Share each one privately; everyone can change');
-  console.log(' theirs on the "Me" tab. Lost one? Reset it with:');
-  console.log('   node scripts/set-password.js <name>');
+  console.log(' To choose your own, set APP_PASSWORD (or');
+  console.log(' APP_PASSWORD_FILE) and restart. Changing the');
+  console.log(' password logs every device out.');
   console.log('==================================================');
   console.log('');
 }
@@ -29,8 +29,13 @@ function main() {
   const config = loadConfig();
   const db = openDatabase(config.dbFile);
 
-  const created = syncPlayers(db, config.players, { hashPassword: hashPasswordSync, generatePassword });
-  if (created.length) printInitialPasswords(created);
+  const added = syncPlayers(db, config.players);
+  if (added.length) log.info(`Players added: ${added.join(', ')}`);
+
+  const login = applyLoginPassword(db, config.password);
+  if (login.status === 'generated') printGeneratedPassword(login.password);
+  if (login.status === 'set') log.info('Login password set');
+  if (login.status === 'changed') log.info('Login password changed: every device was logged out');
 
   const app = createApp({ config, db, log });
   app.locals.sessions.purgeExpired();
@@ -52,4 +57,10 @@ function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  // Configuration problems (bad TIMEZONE, short password…) — say what's wrong, no stack trace.
+  console.error(`Cannot start: ${err.message}`);
+  process.exit(1);
+}

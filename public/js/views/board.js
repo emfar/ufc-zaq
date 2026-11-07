@@ -92,12 +92,12 @@ export function mount(root, ctx) {
       if (leaders.length === 0) {
         return isCurrent
           ? emptyState({
-              iconName: 'crown',
+              iconName: 'champion',
               title: `${monthName(month)} is wide open`,
               text: 'No wins yet. The first tap takes the lead.',
-              action: h('a', { href: '/register', class: 'btn btn-primary' }, icon('plus'), 'Register a win'),
+              action: h('a', { href: '/register', class: 'btn btn-primary' }, icon('register'), 'Register a win'),
             })
-          : emptyState({ iconName: 'podium', title: `No fights in ${monthName(month)}` });
+          : emptyState({ iconName: 'board', title: `No fights in ${monthName(month)}` });
       }
       const top = standings.filter((s) => leaders.some((l) => l.id === s.id));
       const shared = top.length > 1;
@@ -112,7 +112,7 @@ export function mount(root, ctx) {
       return h(
         'section',
         { class: `hero ${isCurrent ? 'hero-live' : 'hero-final'}` },
-        h('div', { class: 'hero-badge' }, icon(isCurrent ? 'crown' : 'trophy')),
+        h('div', { class: 'hero-badge' }, icon(isCurrent ? 'champion' : 'trophy')),
         h('p', { class: 'hero-label' }, label),
         h('h2', { class: 'hero-name' }, joinNames(top.map((t) => t.name))),
         h(
@@ -193,7 +193,7 @@ export function mount(root, ctx) {
       h(
         'div',
         {
-          class: `st-row${r.rank === 1 && r.points > 0 ? ' is-top' : ''}${r.id === session.player.id ? ' is-me' : ''}`,
+          class: `st-row${r.rank === 1 && r.points > 0 ? ' is-top' : ''}`,
         },
         h('span', { class: 'st-rank' }, r.points > 0 ? String(r.rank) : '–'),
         h(
@@ -244,7 +244,7 @@ export function mount(root, ctx) {
             'button',
             { type: 'button', class: 'hof-item', onclick: () => goToMonth(e.month) },
             h('span', { class: 'hof-month' }, monthShort(e.month)),
-            h('span', { class: 'hof-name' }, icon('crown'), joinNames(e.champions.map((c) => c.name))),
+            h('span', { class: 'hof-name' }, icon('champion'), joinNames(e.champions.map((c) => c.name))),
             h('span', { class: 'hof-pts' }, `${e.champions[0].points} pts`),
           ),
         ),

@@ -1,17 +1,17 @@
 import { api, setUnauthorizedHandler } from './api.js';
-import { clear, h, icon, replace } from './dom.js';
-import { avatar, emptyState, toast } from './ui.js';
-import * as accountView from './views/account.js';
+import { clear, h, icon } from './dom.js';
+import { emptyState, toast } from './ui.js';
 import * as boardView from './views/board.js';
 import * as historyView from './views/history.js';
 import * as loginView from './views/login.js';
 import * as registerView from './views/register.js';
+import * as rulesView from './views/rules.js';
 
 const ROUTES = {
   '/': { view: boardView, tab: 'board', title: 'Scoreboard' },
   '/register': { view: registerView, tab: 'register', title: 'Register' },
   '/history': { view: historyView, tab: 'history', title: 'History' },
-  '/account': { view: accountView, tab: 'account', title: 'Me' },
+  '/rules': { view: rulesView, tab: null, title: 'Rules' },
 };
 
 const root = document.getElementById('app');
@@ -34,7 +34,7 @@ function buildShell() {
       icon(iconName, 'tab-icon'),
       h('span', { class: 'tab-label' }, label),
     ));
-  const me = h('a', { href: '/account', class: 'me-chip', 'aria-label': 'Your account' });
+  const rulesLink = h('a', { href: '/rules', class: 'header-btn', 'aria-label': 'Rules and settings' }, icon('rules'));
   const main = h('main', { class: 'view', id: 'view' });
   const el = h(
     'div',
@@ -48,24 +48,23 @@ function buildShell() {
         icon('logo', 'brand-logo'),
         h('span', { class: 'brand-name' }, session.app.name),
       ),
-      me,
+      rulesLink,
     ),
     main,
     h(
       'nav',
       { class: 'tabbar', 'aria-label': 'Main' },
-      tab('board', '/', 'podium', 'Board'),
-      tab('register', '/register', 'plus', 'Register'),
-      tab('history', '/history', 'clock', 'History'),
-      tab('account', '/account', 'user', 'Me'),
+      tab('board', '/', 'board', 'Board'),
+      tab('register', '/register', 'register', 'Register'),
+      tab('history', '/history', 'history', 'History'),
     ),
   );
-  return { el, main, tabs, me };
+  return { el, main, tabs, rulesLink };
 }
 
 function render() {
   const path = location.pathname;
-  const loggedIn = Boolean(session.player);
+  const loggedIn = session.loggedIn;
   if (!loggedIn && path !== '/login') {
     if (ROUTES[path]) afterLogin = path;
     return navigate('/login', { replace: true });
@@ -89,13 +88,13 @@ function render() {
     shell = buildShell();
     clear(root).append(shell.el);
   }
-  replace(shell.me, avatar(session.player, 'avatar-sm'), h('span', { class: 'me-name' }, session.player.name));
   for (const [key, el] of Object.entries(shell.tabs)) {
     const active = key === route.tab;
     el.classList.toggle('is-active', active);
     if (active) el.setAttribute('aria-current', 'page');
     else el.removeAttribute('aria-current');
   }
+  shell.rulesLink.classList.toggle('is-active', path === '/rules');
   clear(shell.main);
   window.scrollTo(0, 0);
   document.title = `${route.title} · ${session.app.name}`;
@@ -124,7 +123,7 @@ function context() {
       } catch {
         // logging out locally is what matters
       }
-      session.player = null;
+      session.loggedIn = false;
       navigate('/login', { replace: true });
     },
   };
@@ -140,10 +139,10 @@ document.addEventListener('click', (e) => {
 window.addEventListener('popstate', () => session && render());
 
 setUnauthorizedHandler(() => {
-  if (!session?.player) return;
-  session.player = null;
+  if (!session?.loggedIn) return;
+  session.loggedIn = false;
   if (ROUTES[location.pathname]) afterLogin = location.pathname;
-  toast({ kind: 'info', title: 'Logged out', text: 'Please log in again.' });
+  toast({ kind: 'info', title: 'Logged out', text: 'Enter the password again.' });
   navigate('/login', { replace: true });
 });
 

@@ -206,18 +206,28 @@ a {
   text-overflow: ellipsis;
 }
 
-.me-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 38px;
-  padding: 0 13px 0 4px;
-  border-radius: 999px;
+.header-btn {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
   background: var(--surface);
   border: 1px solid var(--line);
-  font: 800 15px var(--font-display);
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  color: var(--muted);
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+.header-btn .icon {
+  width: 22px;
+  height: 22px;
+}
+
+.header-btn.is-active {
+  color: var(--text);
+  background: var(--surface-3);
 }
 
 .view {
@@ -234,7 +244,7 @@ a {
   right: 0;
   bottom: 0;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   padding: 6px 8px calc(var(--safe-bottom) + 6px);
   background: rgba(14, 14, 18, 0.92);
   -webkit-backdrop-filter: saturate(140%) blur(14px);
@@ -642,59 +652,32 @@ a {
   text-align: left;
 }
 
+.input-lg {
+  height: 58px;
+  font-size: 19px;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+
+.login-roster {
+  margin-top: 28px;
+  color: var(--faint);
+  font: 800 15px/1.4 var(--font-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.login-roster .dot {
+  color: var(--red);
+}
+
 .login-ask {
+  display: block;
   margin: 0 2px 10px;
   color: var(--muted);
   font: 800 15px var(--font-display);
   letter-spacing: 0.14em;
   text-transform: uppercase;
-}
-
-.pick-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-bottom: 18px;
-}
-
-.pick {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 62px;
-  padding: 0 14px;
-  border-radius: 16px;
-  background: var(--surface);
-  border: 1.5px solid var(--line);
-  font: 800 21px/1 var(--font-display);
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  text-align: left;
-  transition:
-    border-color 0.15s,
-    background 0.15s,
-    transform 0.08s;
-}
-
-.pick:active {
-  transform: scale(0.97);
-}
-
-.pick:last-child:nth-child(odd) {
-  grid-column: 1 / -1;
-  justify-content: center;
-}
-
-.pick.is-selected {
-  border-color: var(--red);
-  background: linear-gradient(180deg, rgba(229, 38, 45, 0.2), rgba(229, 38, 45, 0.06));
-  box-shadow: 0 0 0 3px rgba(229, 38, 45, 0.16);
-}
-
-.pick-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------- register */
@@ -1139,12 +1122,6 @@ a {
   white-space: nowrap;
 }
 
-.is-me .st-name-text::after {
-  content: '•';
-  margin-left: 6px;
-  color: var(--red);
-}
-
 .st-bar {
   display: block;
   height: 4px;
@@ -1339,28 +1316,6 @@ a {
 
 /* ------------------------------------------------------------ account */
 
-.profile {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.profile-name {
-  font: 800 30px/1 var(--font-display);
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-}
-
-.profile-sub {
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 14px;
-}
-
-.form .btn {
-  margin-top: 2px;
-}
-
 .rules-list {
   display: grid;
   gap: 8px;
@@ -1413,7 +1368,8 @@ a {
   height: 26px;
 }
 
-.toast-ok .toast-icon {
+.toast-ok .toast-icon,
+.toast-win .toast-icon {
   color: var(--green);
 }
 
@@ -1483,7 +1439,8 @@ a {
   animation: toast-timer linear forwards;
 }
 
-.toast-ok .toast-timer {
+.toast-ok .toast-timer,
+.toast-win .toast-timer {
   background: var(--green);
 }
 
@@ -1592,9 +1549,6 @@ a {
   }
   .reg-name {
     font-size: 20px;
-  }
-  .me-name {
-    display: none;
   }
 }
 

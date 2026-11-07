@@ -8,7 +8,6 @@ const TAP_COOLDOWN_MS = 700; // swallows accidental double taps
 
 export function mount(root, ctx) {
   const { session, api, toast } = ctx;
-  const me = session.player;
   const tz = session.app.timezone;
   const points = Object.fromEntries(session.app.rules.methods.map((m) => [m.key, m.points]));
 
@@ -49,13 +48,13 @@ export function mount(root, ctx) {
   const rows = new Map();
   for (const player of session.players) {
     const stats = h('span', { class: 'reg-stats' }, '—');
-    const crown = icon('crown', 'reg-crown');
+    const crown = icon('champion', 'reg-crown');
     crown.hidden = true;
     const tapWin = tapButton(player, 'win', 'WIN', `+${points.win}`);
     const tapKo = tapButton(player, 'ko1', 'R1 KO', `+${points.ko1}`);
     const row = h(
       'div',
-      { class: `reg-row${player.id === me.id ? ' is-me' : ''}` },
+      { class: 'reg-row' },
       h('div', { class: 'reg-who' }, h('div', { class: 'reg-name' }, h('span', {}, player.name), crown), stats),
       tapWin,
       tapKo,
@@ -72,7 +71,7 @@ export function mount(root, ctx) {
         class: `tap tap-${method}`,
         'aria-label': `${LABELS[method]} for ${player.name}, plus ${points[method]} points`,
       },
-      method === 'ko1' ? icon('bolt', 'tap-icon') : null,
+      icon(method === 'ko1' ? 'ko' : 'win', 'tap-icon'),
       h('span', { class: 'tap-label' }, label),
       h('span', { class: 'tap-pts' }, pts),
     );
@@ -92,7 +91,7 @@ export function mount(root, ctx) {
       apply(live);
       celebrate(player.id, method);
       toast({
-        kind: method === 'ko1' ? 'ko' : 'ok',
+        kind: method === 'ko1' ? 'ko' : 'win',
         title: `${player.name} +${win.points}`,
         text: LABELS[method],
         duration: 6000,
@@ -193,11 +192,7 @@ export function mount(root, ctx) {
         'div',
         { class: 'recent-main' },
         h('div', { class: 'recent-line' }, h('strong', {}, win.playerName), methodBadge(win.method, win.points)),
-        h(
-          'div',
-          { class: 'recent-meta' },
-          `${when} · added by ${win.createdBy.id === me.id ? 'you' : win.createdBy.name}`,
-        ),
+        h('div', { class: 'recent-meta' }, when),
       ),
       confirmButton({
         className: 'icon-btn',

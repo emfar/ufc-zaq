@@ -16,7 +16,6 @@ const memory = { month: null };
 
 export function mount(root, ctx) {
   const { api, session, toast } = ctx;
-  const me = session.player;
   const tz = session.app.timezone;
   let data = null;
   let alive = true;
@@ -47,7 +46,7 @@ export function mount(root, ctx) {
 
   function render() {
     const { month, wins, totals } = data;
-    const removedCount = wins.filter((w) => w.removed).length;
+    const removedCount = wins.filter((w) => w.removedAt !== null).length;
     const subtitle = [
       plural(totals.wins, 'win'),
       `${totals.points} pts`,
@@ -64,7 +63,7 @@ export function mount(root, ctx) {
       onChange: goToMonth,
     });
     if (wins.length === 0) {
-      replace(content, nav, emptyState({ iconName: 'clock', title: `Nothing registered in ${monthName(month)}` }));
+      replace(content, nav, emptyState({ iconName: 'history', title: `Nothing registered in ${monthName(month)}` }));
       return;
     }
 
@@ -79,7 +78,7 @@ export function mount(root, ctx) {
       content,
       nav,
       ...days.map(({ day, wins: dayWins }) => {
-        const counted = dayWins.filter((w) => !w.removed);
+        const counted = dayWins.filter((w) => w.removedAt === null);
         return h(
           'section',
           { class: 'day' },
@@ -95,10 +94,8 @@ export function mount(root, ctx) {
     );
   }
 
-  const who = (p) => (p.id === me.id ? 'you' : p.name);
-
   function item(win) {
-    const removed = Boolean(win.removed);
+    const removed = win.removedAt !== null;
     const action = removed
       ? h(
           'button',
@@ -132,18 +129,7 @@ export function mount(root, ctx) {
           h('strong', { class: 'log-name' }, win.playerName),
           methodBadge(win.method, win.points),
         ),
-        h(
-          'div',
-          { class: 'log-meta' },
-          `added by ${who(win.createdBy)}`,
-          removed
-            ? h(
-                'span',
-                { class: 'log-removed' },
-                ` · removed by ${who(win.removed.by)} at ${timeLabel(win.removed.at, tz)}`,
-              )
-            : null,
-        ),
+        removed ? h('div', { class: 'log-meta log-removed' }, `Removed at ${timeLabel(win.removedAt, tz)}`) : null,
       ),
       action,
     );

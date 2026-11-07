@@ -18,7 +18,7 @@ export function toast({ title, text = '', kind = 'ok', action = null, duration =
   }
   dismissCurrent?.();
 
-  const iconName = { ok: 'check', ko: 'bolt', error: 'alert', info: 'check' }[kind] ?? 'check';
+  const iconName = { ok: 'check', win: 'win', ko: 'ko', error: 'alert', info: 'check' }[kind] ?? 'check';
   const timerBar = h('span', { class: 'toast-timer', style: { animationDuration: `${duration}ms` } });
   const actionBtn =
     action &&
@@ -136,7 +136,7 @@ export function methodBadge(method, points) {
   return h(
     'span',
     { class: `badge ${ko ? 'badge-ko' : 'badge-win'}` },
-    ko ? icon('bolt') : null,
+    icon(ko ? 'ko' : 'win'),
     ko ? 'R1 KO' : 'WIN',
     h('b', {}, `+${points}`),
   );
@@ -149,7 +149,7 @@ export function avatar(person, extra = '') {
   return el;
 }
 
-export function emptyState({ iconName = 'podium', title, text, action }) {
+export function emptyState({ iconName = 'board', title, text, action }) {
   return h(
     'div',
     { class: 'empty' },

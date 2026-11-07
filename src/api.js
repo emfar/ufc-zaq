@@ -1,30 +1,32 @@
 'use strict';
 
 const express = require('express');
-const { DUMMY_HASH, hashPassword, requirePlayer, validateNewPassword, verifyPassword } = require('./auth');
+const { loginPasswordHash, requireLogin, verifyPassword } = require('./auth');
 const { FailureLimiter } = require('./rate-limit');
 const { METHODS, RULES, buildLeague, leadersOf } = require('./scoring');
 const { dayKey, daysLeftInMonth, isMonthKey, monthKey, shiftMonth } = require('./time');
 
-// Removing your own entry within this window is an "undo": it disappears
-// from the history. Later removals (or anyone else's) stay visible there.
+// Taking a win back on the same device within this window is an "undo": it
+// disappears from the history. Later removals, or removals from another
+// device, stay visible there (and can be restored).
 const UNDO_WINDOW_MS = 5 * 60 * 1000;
 const RECENT_LIMIT = 5;
 const REQUEST_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+const LIMIT_WINDOW_MS = 15 * 60 * 1000;
 
 function createApi({ config, db, sessions, log }) {
   const router = express.Router();
   const tz = config.timezone;
 
-  const ipLimiter = new FailureLimiter({ max: 20, windowMs: 15 * 60 * 1000 });
-  const accountLimiter = new FailureLimiter({ max: 10, windowMs: 15 * 60 * 1000 });
+  // Everyone shares one password, so guessing is limited per network address
+  // and in total. The total limit only blocks new logins — devices that are
+  // already logged in keep working.
+  const ipLimiter = new FailureLimiter({ max: 10, windowMs: LIMIT_WINDOW_MS });
+  const globalLimiter = new FailureLimiter({ max: 100, windowMs: LIMIT_WINDOW_MS });
 
   const sql = {
     players: db.prepare('SELECT id, name, active FROM players ORDER BY sort_order, id'),
     activePlayer: db.prepare('SELECT id, name FROM players WHERE id = ? AND active = 1'),
-    playerByName: db.prepare('SELECT id, name, password_hash FROM players WHERE name = ? AND active = 1'),
-    passwordHash: db.prepare('SELECT password_hash FROM players WHERE id = ?'),
-    setPassword: db.prepare('UPDATE players SET password_hash = ?, password_changed_at = ? WHERE id = ?'),
     monthly: db.prepare(`
       SELECT month, player_id AS playerId, COUNT(*) AS wins,
              SUM(CASE WHEN method = 'ko1' THEN 1 ELSE 0 END) AS kos, SUM(points) AS points
@@ -32,23 +34,18 @@ function createApi({ config, db, sessions, log }) {
       GROUP BY month, player_id
     `),
     insertWin: db.prepare(`
-      INSERT INTO wins (player_id, method, points, month, created_at, created_by, request_id)
-      VALUES (@playerId, @method, @points, @month, @createdAt, @createdBy, @requestId)
+      INSERT INTO wins (player_id, method, points, month, created_at, created_session, request_id)
+      VALUES (@playerId, @method, @points, @month, @createdAt, @sessionId, @requestId)
     `),
     winById: db.prepare('SELECT * FROM wins WHERE id = ?'),
     winByRequestId: db.prepare('SELECT id FROM wins WHERE request_id = ?'),
-    removeWin: db.prepare('UPDATE wins SET deleted_at = ?, deleted_by = ?, deleted_reason = ? WHERE id = ?'),
-    restoreWin: db.prepare('UPDATE wins SET deleted_at = NULL, deleted_by = NULL, deleted_reason = NULL WHERE id = ?'),
+    removeWin: db.prepare('UPDATE wins SET deleted_at = ?, deleted_reason = ? WHERE id = ?'),
+    restoreWin: db.prepare('UPDATE wins SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?'),
   };
 
   const WIN_SELECT = `
-    SELECT w.id, w.player_id, pw.name AS player_name, w.method, w.points, w.created_at,
-           w.created_by, pc.name AS created_by_name,
-           w.deleted_at, w.deleted_by, pd.name AS deleted_by_name
-    FROM wins w
-    JOIN players pw ON pw.id = w.player_id
-    JOIN players pc ON pc.id = w.created_by
-    LEFT JOIN players pd ON pd.id = w.deleted_by
+    SELECT w.id, w.player_id, p.name AS player_name, w.method, w.points, w.created_at, w.deleted_at
+    FROM wins w JOIN players p ON p.id = w.player_id
   `;
   sql.winView = db.prepare(`${WIN_SELECT} WHERE w.id = ?`);
   sql.recent = db.prepare(`${WIN_SELECT}
@@ -66,8 +63,7 @@ function createApi({ config, db, sessions, log }) {
     points: row.points,
     createdAt: row.created_at,
     day: dayKey(row.created_at, tz),
-    createdBy: { id: row.created_by, name: row.created_by_name },
-    removed: row.deleted_at ? { at: row.deleted_at, by: { id: row.deleted_by, name: row.deleted_by_name } } : null,
+    removedAt: row.deleted_at ?? null,
   });
 
   const publicPlayers = () =>
@@ -124,19 +120,18 @@ function createApi({ config, db, sessions, log }) {
 
   router.get('/session', (req, res) => {
     res.json({
-      player: req.player,
+      loggedIn: req.sessionId !== null,
       players: publicPlayers(),
       app: { name: config.appName, timezone: tz, rules: RULES },
     });
   });
 
   router.post('/login', async (req, res) => {
-    const { name, password } = req.body ?? {};
-    if (typeof name !== 'string' || !name.trim() || typeof password !== 'string' || !password) {
-      return res.status(400).json({ error: 'Pick your name and enter your password' });
+    const { password } = req.body ?? {};
+    if (typeof password !== 'string' || !password) {
+      return res.status(400).json({ error: 'Enter the password' });
     }
-    const nameKey = name.trim().toLowerCase();
-    const wait = Math.max(ipLimiter.retryAfter(req.ip), accountLimiter.retryAfter(nameKey));
+    const wait = Math.max(ipLimiter.retryAfter(req.ip), globalLimiter.retryAfter('all'));
     if (wait > 0) {
       const minutes = Math.ceil(wait / 60000);
       res.set('Retry-After', String(Math.ceil(wait / 1000)));
@@ -145,18 +140,18 @@ function createApi({ config, db, sessions, log }) {
       });
     }
 
-    const player = password.length <= 1024 ? sql.playerByName.get(name.trim()) : undefined;
-    const valid = await verifyPassword(password.slice(0, 1024), player?.password_hash ?? DUMMY_HASH);
-    if (!player || !valid) {
+    const hash = loginPasswordHash(db);
+    const valid = Boolean(hash) && password.length <= 1024 && (await verifyPassword(password, hash));
+    if (!valid) {
       ipLimiter.fail(req.ip);
-      accountLimiter.fail(nameKey);
-      return res.status(401).json({ error: 'Wrong name or password' });
+      globalLimiter.fail('all');
+      return res.status(401).json({ error: 'Wrong password' });
     }
 
-    accountLimiter.reset(nameKey);
-    sessions.create(req, res, player.id);
-    log.info(`${player.name} logged in`);
-    res.json({ player: brief(player) });
+    ipLimiter.reset(req.ip);
+    const sessionId = sessions.create(req, res);
+    log.info(`New device logged in (session ${sessionId})`);
+    res.json({ ok: true });
   });
 
   router.post('/logout', (req, res) => {
@@ -166,7 +161,7 @@ function createApi({ config, db, sessions, log }) {
 
   // --------------------------------------------------------- logged in only
 
-  router.use(requirePlayer);
+  router.use(requireLogin);
 
   router.get('/live', (req, res) => {
     res.json(liveState());
@@ -193,10 +188,10 @@ function createApi({ config, db, sessions, log }) {
       points: rule.points,
       month: monthKey(now, tz),
       createdAt: now,
-      createdBy: req.player.id,
+      sessionId: req.sessionId,
       requestId: requestId ?? null,
     });
-    log.info(`${req.player.name} registered ${rule.short} (+${rule.points}) for ${player.name}`);
+    log.info(`Registered ${rule.short} (+${rule.points}) for ${player.name} (win ${lastInsertRowid})`);
     res.status(201).json({ win: toWin(sql.winView.get(lastInsertRowid)), live: liveState() });
   });
 
@@ -213,9 +208,9 @@ function createApi({ config, db, sessions, log }) {
     if (win.deleted_at) return res.json({ result: 'already-removed', live: liveState() });
 
     const now = Date.now();
-    const undo = win.created_by === req.player.id && now - win.created_at <= UNDO_WINDOW_MS;
-    sql.removeWin.run(now, req.player.id, undo ? 'undo' : 'removed', win.id);
-    log.info(`${req.player.name} ${undo ? 'undid' : 'removed'} win #${win.id}`);
+    const undo = win.created_session === req.sessionId && now - win.created_at <= UNDO_WINDOW_MS;
+    sql.removeWin.run(now, undo ? 'undo' : 'removed', win.id);
+    log.info(`${undo ? 'Undid' : 'Removed'} win ${win.id}`);
     res.json({ result: undo ? 'undone' : 'removed', live: liveState() });
   });
 
@@ -225,7 +220,7 @@ function createApi({ config, db, sessions, log }) {
     if (win.deleted_reason === 'undo') return res.status(404).json({ error: 'That win no longer exists' });
     if (win.deleted_at) {
       sql.restoreWin.run(win.id);
-      log.info(`${req.player.name} restored win #${win.id}`);
+      log.info(`Restored win ${win.id}`);
     }
     res.json({ win: toWin(sql.winView.get(win.id)), live: liveState() });
   });
@@ -258,7 +253,7 @@ function createApi({ config, db, sessions, log }) {
     if (!month) return;
 
     const wins = sql.history.all(month).map(toWin);
-    const counted = wins.filter((w) => !w.removed);
+    const counted = wins.filter((w) => w.removedAt === null);
     res.json({
       month,
       currentMonth: lg.currentMonth,
@@ -267,26 +262,6 @@ function createApi({ config, db, sessions, log }) {
       wins,
       totals: { wins: counted.length, points: counted.reduce((sum, w) => sum + w.points, 0) },
     });
-  });
-
-  router.post('/account/password', async (req, res) => {
-    const { currentPassword, newPassword } = req.body ?? {};
-    const key = req.player.name.toLowerCase();
-    const wait = accountLimiter.retryAfter(key);
-    if (wait > 0) return res.status(429).json({ error: 'Too many wrong attempts. Try again later.' });
-
-    const { password_hash: hash } = sql.passwordHash.get(req.player.id);
-    if (typeof currentPassword !== 'string' || !(await verifyPassword(currentPassword.slice(0, 1024), hash))) {
-      accountLimiter.fail(key);
-      return res.status(400).json({ error: 'Your current password is wrong' });
-    }
-    const problem = validateNewPassword(newPassword);
-    if (problem) return res.status(400).json({ error: problem });
-
-    sql.setPassword.run(await hashPassword(newPassword), Date.now(), req.player.id);
-    sessions.destroyOthers(req.player.id, req.sessionId);
-    log.info(`${req.player.name} changed their password`);
-    res.json({ ok: true });
   });
 
   return router;

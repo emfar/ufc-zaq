@@ -7,7 +7,7 @@ const { createApi } = require('./api');
 const { createSessionStore } = require('./auth');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const APP_ROUTES = ['/', '/login', '/register', '/history', '/account'];
+const APP_ROUTES = ['/', '/login', '/register', '/history', '/rules'];
 
 const escapeHtml = (value) =>
   String(value).replace(

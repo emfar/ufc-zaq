@@ -1,80 +1,36 @@
-import { h, icon, replace } from '../dom.js';
-import { avatar } from '../ui.js';
-
-const LAST_NAME_KEY = 'ufc:last-name';
-
-function remembered() {
-  try {
-    return localStorage.getItem(LAST_NAME_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function remember(name) {
-  try {
-    localStorage.setItem(LAST_NAME_KEY, name);
-  } catch {
-    // private mode etc. — not important
-  }
-}
+import { h, icon } from '../dom.js';
 
 export function mount(root, ctx) {
   const { api, session, onLogin } = ctx;
-  let selected = session.players.find((p) => p.name === remembered()) ?? null;
 
+  // A fixed, hidden username lets phone password managers save the password.
   const username = h('input', {
     type: 'text',
     name: 'username',
     autocomplete: 'username',
+    value: session.app.name,
     class: 'visually-hidden',
     tabindex: '-1',
     'aria-hidden': 'true',
+    readonly: true,
   });
   const password = h('input', {
-    class: 'input',
+    class: 'input input-lg',
     type: 'password',
     name: 'password',
     id: 'password',
     autocomplete: 'current-password',
-    placeholder: 'Password',
-    'aria-label': 'Password',
+    placeholder: 'Same for everyone',
     maxlength: '128',
+    enterkeyhint: 'go',
   });
-  const submit = h('button', { type: 'submit', class: 'btn btn-primary btn-block btn-lg' });
+  const submit = h('button', { type: 'submit', class: 'btn btn-primary btn-block btn-lg' }, 'Enter the octagon');
   const error = h('p', { class: 'form-msg form-msg-error', role: 'alert' });
-
-  const picks = session.players.map((p) => {
-    const btn = h(
-      'button',
-      { type: 'button', class: 'pick', 'aria-pressed': 'false', onclick: () => select(p, true) },
-      avatar(p),
-      h('span', { class: 'pick-name' }, p.name),
-    );
-    return { player: p, btn };
-  });
-
-  function select(player, focus) {
-    selected = player;
-    username.value = player.name;
-    for (const { player: p, btn } of picks) {
-      btn.classList.toggle('is-selected', p.id === player.id);
-      btn.setAttribute('aria-pressed', String(p.id === player.id));
-    }
-    replace(submit, `Enter as ${player.name}`);
-    error.textContent = '';
-    if (focus) password.focus();
-  }
 
   const form = h(
     'form',
     { class: 'login-form', novalidate: true },
-    h('p', { class: 'login-ask' }, "Who's fighting?"),
-    h(
-      'div',
-      { class: 'pick-grid' },
-      picks.map((p) => p.btn),
-    ),
+    h('label', { class: 'login-ask', for: 'password' }, 'Club password'),
     username,
     password,
     error,
@@ -83,20 +39,15 @@ export function mount(root, ctx) {
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!selected) {
-      error.textContent = 'Tap your name first';
-      return;
-    }
     if (!password.value) {
-      error.textContent = 'Enter your password';
+      error.textContent = 'Enter the password';
       password.focus();
       return;
     }
     submit.disabled = true;
     error.textContent = '';
     try {
-      await api.post('/login', { name: selected.name, password: password.value });
-      remember(selected.name);
+      await api.post('/login', { password: password.value });
       await onLogin();
     } catch (err) {
       error.textContent = err.message;
@@ -115,9 +66,11 @@ export function mount(root, ctx) {
       h('h1', { class: 'login-title' }, session.app.name),
       h('p', { class: 'login-tag' }, 'Monthly fight league'),
       form,
+      h(
+        'p',
+        { class: 'login-roster' },
+        session.players.map((p, i) => [i ? h('span', { class: 'dot', 'aria-hidden': 'true' }, ' · ') : null, p.name]),
+      ),
     ),
   );
-
-  if (selected) select(selected, false);
-  else replace(submit, 'Enter the octagon');
 }

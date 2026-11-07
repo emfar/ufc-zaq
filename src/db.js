@@ -8,40 +8,45 @@ const Database = require('better-sqlite3');
 // Never edit a migration that has shipped — append a new one instead.
 const MIGRATIONS = [
   `
-  CREATE TABLE players (
-    id                  INTEGER PRIMARY KEY,
-    name                TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash       TEXT    NOT NULL,
-    sort_order          INTEGER NOT NULL DEFAULT 0,
-    active              INTEGER NOT NULL DEFAULT 1,
-    created_at          INTEGER NOT NULL,
-    password_changed_at INTEGER
+  -- App-wide settings, e.g. the hash of the shared login password.
+  CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
   );
 
+  -- The fighters on the board (configured with PLAYERS). Nobody logs in as
+  -- a player: everyone shares one login.
+  CREATE TABLE players (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+  );
+
+  -- One row per logged-in device.
   CREATE TABLE sessions (
-    token_hash   TEXT    PRIMARY KEY,
-    player_id    INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    id           INTEGER PRIMARY KEY,
+    token_hash   TEXT    NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL
   );
-  CREATE INDEX sessions_by_player ON sessions(player_id);
 
   -- One row per registered win. Removed wins are never deleted: they get
-  -- deleted_at/by and a reason — 'undo' (own entry, taken back right away,
-  -- hidden from history) or 'removed' (shown in history, can be restored).
+  -- deleted_at and a reason — 'undo' (taken back on the same device right
+  -- away, hidden from history) or 'removed' (shown in history, restorable).
   CREATE TABLE wins (
-    id             INTEGER PRIMARY KEY,
-    player_id      INTEGER NOT NULL REFERENCES players(id),
-    method         TEXT    NOT NULL CHECK (method IN ('win', 'ko1')),
-    points         INTEGER NOT NULL CHECK (points > 0),
-    month          TEXT    NOT NULL,      -- 'YYYY-MM' in the league time zone
-    created_at     INTEGER NOT NULL,      -- epoch milliseconds
-    created_by     INTEGER NOT NULL REFERENCES players(id),
-    request_id     TEXT    UNIQUE,        -- client-generated, makes retries safe
-    deleted_at     INTEGER,
-    deleted_by     INTEGER REFERENCES players(id),
-    deleted_reason TEXT    CHECK (deleted_reason IN ('undo', 'removed'))
+    id              INTEGER PRIMARY KEY,
+    player_id       INTEGER NOT NULL REFERENCES players(id),
+    method          TEXT    NOT NULL CHECK (method IN ('win', 'ko1')),
+    points          INTEGER NOT NULL CHECK (points > 0),
+    month           TEXT    NOT NULL,     -- 'YYYY-MM' in the league time zone
+    created_at      INTEGER NOT NULL,     -- epoch milliseconds
+    created_session INTEGER,              -- sessions.id of the device that tapped it
+    request_id      TEXT    UNIQUE,       -- client-generated, makes retries safe
+    deleted_at      INTEGER,
+    deleted_reason  TEXT    CHECK (deleted_reason IN ('undo', 'removed'))
   );
   CREATE INDEX wins_by_month ON wins(month, created_at);
   `,
@@ -69,38 +74,42 @@ function openDatabase(file) {
 }
 
 /**
- * Make the players table match the configured list: add missing players
- * (with a generated password, returned so the caller can print it), keep the
- * configured order, and deactivate players that were removed from the list.
- * Removed players keep their history; they just can't log in or be picked.
+ * Make the players table match the configured list: add missing players,
+ * keep the configured order, and deactivate players removed from the list.
+ * Removed players keep their history; they just can't be picked any more.
+ * Returns the names that were added.
  */
-function syncPlayers(db, names, { hashPassword, generatePassword, now = Date.now() }) {
-  const created = [];
+function syncPlayers(db, names, now = Date.now()) {
+  const added = [];
   const existing = db.prepare('SELECT id, name FROM players').all();
   const byName = new Map(existing.map((p) => [p.name.toLowerCase(), p]));
-
-  const insert = db.prepare(
-    'INSERT INTO players (name, password_hash, sort_order, active, created_at) VALUES (?, ?, ?, 1, ?)',
-  );
+  const insert = db.prepare('INSERT INTO players (name, sort_order, active, created_at) VALUES (?, ?, 1, ?)');
   const update = db.prepare('UPDATE players SET sort_order = ?, active = ? WHERE id = ?');
-
   const listed = new Set(names.map((n) => n.toLowerCase()));
+
   db.transaction(() => {
     names.forEach((name, index) => {
       const player = byName.get(name.toLowerCase());
       if (player) {
         update.run(index, 1, player.id);
       } else {
-        const password = generatePassword();
-        insert.run(name, hashPassword(password), index, now);
-        created.push({ name, password });
+        insert.run(name, index, now);
+        added.push(name);
       }
     });
     for (const player of existing) {
       if (!listed.has(player.name.toLowerCase())) update.run(names.length, 0, player.id);
     }
   })();
-  return created;
+  return added;
 }
 
-module.exports = { openDatabase, syncPlayers };
+const getSetting = (db, key) => db.prepare('SELECT value FROM settings WHERE key = ?').get(key)?.value ?? null;
+
+function setSetting(db, key, value) {
+  db.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+  ).run(key, value);
+}
+
+module.exports = { openDatabase, syncPlayers, getSetting, setSetting };

@@ -6,7 +6,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { createApp } = require('../src/app');
 const { loadConfig } = require('../src/config');
-const { openDatabase, syncPlayers } = require('../src/db');
+const { openDatabase, setSetting, syncPlayers } = require('../src/db');
+
+const PASSWORD = 'club-pass-123';
 
 // Same format the app stores, but with a cheap cost factor so tests stay
 // fast. verifyPassword reads the parameters from the stored string.
@@ -18,16 +20,19 @@ function fastHash(password) {
 
 const silentLog = { info() {}, error() {} };
 
+function tempDir(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ufc-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
 /** Starts the real app on a random port with a fresh database. */
 async function startServer(t, env = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ufc-test-'));
+  const dir = tempDir(t);
   const config = loadConfig({ DATA_DIR: dir, TIMEZONE: 'Asia/Baku', ...env });
   const db = openDatabase(config.dbFile);
-  const created = syncPlayers(db, config.players, {
-    hashPassword: fastHash,
-    generatePassword: () => crypto.randomUUID(),
-  });
-  const passwords = Object.fromEntries(created.map((c) => [c.name, c.password]));
+  syncPlayers(db, config.players);
+  setSetting(db, 'login_password_hash', fastHash(PASSWORD));
   const ids = Object.fromEntries(
     db
       .prepare('SELECT name, id FROM players')
@@ -43,20 +48,19 @@ async function startServer(t, env = {}) {
   t.after(async () => {
     await new Promise((resolve) => server.close(resolve));
     db.close();
-    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   return {
     base,
     db,
     config,
-    passwords,
     ids,
     client: () => createClient(base),
-    async login(name) {
+    /** A new logged-in device. */
+    async login(password = PASSWORD) {
       const c = createClient(base);
-      const res = await c.post('/api/login', { name, password: passwords[name] });
-      if (res.status !== 200) throw new Error(`login failed for ${name}: ${res.status}`);
+      const res = await c.post('/api/login', { password });
+      if (res.status !== 200) throw new Error(`login failed: ${res.status}`);
       return c;
     },
   };
@@ -102,27 +106,15 @@ function createClient(base) {
 }
 
 /** Insert a win directly (for past months / custom timestamps). */
-function insertWin(
-  db,
-  { playerId, method = 'win', month, createdAt = Date.now(), createdBy = playerId, deleted = false },
-) {
+function insertWin(db, { playerId, method = 'win', month, createdAt = Date.now(), deleted = false }) {
   const points = method === 'ko1' ? 2 : 1;
   return db
     .prepare(
-      `INSERT INTO wins (player_id, method, points, month, created_at, created_by, deleted_at, deleted_by, deleted_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO wins (player_id, method, points, month, created_at, deleted_at, deleted_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(
-      playerId,
-      method,
-      points,
-      month,
-      createdAt,
-      createdBy,
-      deleted ? createdAt : null,
-      deleted ? createdBy : null,
-      deleted ? 'removed' : null,
-    ).lastInsertRowid;
+    .run(playerId, method, points, month, createdAt, deleted ? createdAt : null, deleted ? 'removed' : null)
+    .lastInsertRowid;
 }
 
-module.exports = { startServer, insertWin, fastHash };
+module.exports = { PASSWORD, startServer, insertWin, fastHash, tempDir };

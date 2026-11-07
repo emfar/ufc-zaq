@@ -2,19 +2,21 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { insertWin, startServer } = require('./helpers');
+const { PASSWORD, insertWin, startServer } = require('./helpers');
+const { applyLoginPassword } = require('../src/auth');
+const { syncPlayers } = require('../src/db');
 const { monthKey, shiftMonth } = require('../src/time');
 
 const PLAYERS = ['Farrukh', 'Ramil', 'Ibrahim', 'Hikmat', 'Ali'];
 const thisMonth = () => monthKey(Date.now(), 'Asia/Baku');
 
-test('logged out: session lists the five players, everything else needs a login', async (t) => {
+test('logged out: session lists the players, everything else needs the password', async (t) => {
   const s = await startServer(t);
   const c = s.client();
 
   const session = await c.get('/api/session');
   assert.equal(session.status, 200);
-  assert.equal(session.data.player, null);
+  assert.equal(session.data.loggedIn, false);
   assert.deepEqual(
     session.data.players.map((p) => p.name),
     PLAYERS,
@@ -34,54 +36,64 @@ test('logged out: session lists the five players, everything else needs a login'
   assert.equal((await c.post('/api/wins', { playerId: s.ids.Ali, method: 'win' })).status, 401);
 });
 
-test('login: wrong password, unknown name, then success with a session cookie', async (t) => {
+test('one shared password logs a device in with a session cookie', async (t) => {
   const s = await startServer(t);
   const c = s.client();
 
   assert.equal((await c.post('/api/login', {})).status, 400);
-  assert.equal((await c.post('/api/login', { name: 'Ramil', password: 'nope' })).status, 401);
-  assert.equal((await c.post('/api/login', { name: 'Nobody', password: 'nope' })).status, 401);
+  assert.equal((await c.post('/api/login', { password: 'nope-nope' })).status, 401);
+  assert.equal((await c.post('/api/login', { name: 'Ramil', password: 'wrong' })).status, 401);
   assert.equal(c.cookie, '');
 
-  const ok = await c.post('/api/login', { name: 'ramil', password: s.passwords.Ramil }); // any case
+  const ok = await c.post('/api/login', { password: PASSWORD });
   assert.equal(ok.status, 200);
-  assert.deepEqual(ok.data.player, { id: s.ids.Ramil, name: 'Ramil' });
   const setCookie = ok.headers.get('set-cookie');
   assert.match(setCookie, /ufc_session=/);
   assert.match(setCookie, /HttpOnly/i);
   assert.match(setCookie, /SameSite=Lax/i);
-
-  const session = await c.get('/api/session');
-  assert.deepEqual(session.data.player, { id: s.ids.Ramil, name: 'Ramil' });
+  assert.equal((await c.get('/api/session')).data.loggedIn, true);
+  assert.equal((await c.get('/api/live')).status, 200);
 });
 
-test('too many wrong passwords locks the account for a while', async (t) => {
+test('wrong guesses are limited per network address', async (t) => {
   const s = await startServer(t);
   const c = s.client();
   for (let i = 0; i < 10; i++) {
-    assert.equal((await c.post('/api/login', { name: 'Ali', password: `guess-${i}` })).status, 401);
+    assert.equal((await c.post('/api/login', { password: `guess-${i}` })).status, 401);
   }
-  const blocked = await c.post('/api/login', { name: 'Ali', password: s.passwords.Ali });
+  const blocked = await c.post('/api/login', { password: PASSWORD });
   assert.equal(blocked.status, 429);
   assert.match(blocked.data.error, /Try again in 15 minutes/);
   assert.ok(Number(blocked.headers.get('retry-after')) > 0);
+});
 
-  // Other accounts are unaffected.
-  assert.equal((await c.post('/api/login', { name: 'Ramil', password: s.passwords.Ramil })).status, 200);
+test('wrong guesses from many addresses trip the overall limit, logged-in devices keep working', async (t) => {
+  const s = await startServer(t, { TRUST_PROXY: 'true' });
+  const friend = await s.login();
+  const attacker = s.client();
+  for (let i = 0; i < 100; i++) {
+    const res = await attacker.post('/api/login', { password: `guess-${i}` }, { 'x-forwarded-for': `203.0.113.${i}` });
+    assert.equal(res.status, 401);
+  }
+  const fromNewAddress = await s
+    .client()
+    .post('/api/login', { password: PASSWORD }, { 'x-forwarded-for': '198.51.100.7' });
+  assert.equal(fromNewAddress.status, 429);
+  assert.equal((await friend.get('/api/live')).status, 200);
 });
 
 test('one tap registers a win (+1) or a first-round KO (+2)', async (t) => {
   const s = await startServer(t);
-  const ali = await s.login('Ali');
+  const c = await s.login();
 
-  const win = await ali.post('/api/wins', { playerId: s.ids.Ramil, method: 'win' });
+  const win = await c.post('/api/wins', { playerId: s.ids.Ramil, method: 'win' });
   assert.equal(win.status, 201);
   assert.equal(win.data.win.points, 1);
   assert.equal(win.data.win.playerName, 'Ramil');
-  assert.deepEqual(win.data.win.createdBy, { id: s.ids.Ali, name: 'Ali' });
-  assert.equal(win.data.win.removed, null);
+  assert.equal(win.data.win.removedAt, null);
+  assert.equal(win.data.win.createdBy, undefined); // no per-person attribution any more
 
-  const ko = await ali.post('/api/wins', { playerId: s.ids.Hikmat, method: 'ko1' });
+  const ko = await c.post('/api/wins', { playerId: s.ids.Hikmat, method: 'ko1' });
   assert.equal(ko.status, 201);
   assert.equal(ko.data.win.points, 2);
 
@@ -95,12 +107,12 @@ test('one tap registers a win (+1) or a first-round KO (+2)', async (t) => {
   assert.deepEqual(
     live.recent.map((w) => w.playerName),
     ['Hikmat', 'Ramil'],
-  ); // newest first
+  );
 });
 
 test('a retried tap (same request id) is only counted once', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Farrukh');
+  const c = await s.login();
   const body = { playerId: s.ids.Ibrahim, method: 'ko1', requestId: 'tap-0123456789abcdef' };
 
   const first = await c.post('/api/wins', body);
@@ -113,7 +125,7 @@ test('a retried tap (same request id) is only counted once', async (t) => {
 
 test('registering rejects bad input', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Farrukh');
+  const c = await s.login();
   const bad = [
     { playerId: s.ids.Ali, method: 'decision' },
     { playerId: s.ids.Ali, method: 'toString' },
@@ -127,27 +139,27 @@ test('registering rejects bad input', async (t) => {
 
 test('cross-site and non-JSON writes are refused', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Farrukh');
+  const c = await s.login();
   const body = JSON.stringify({ playerId: s.ids.Ali, method: 'win' });
 
-  const form = await c.call('POST', '/api/wins', body, { 'content-type': 'text/plain' });
-  assert.equal(form.status, 415);
-
+  assert.equal((await c.call('POST', '/api/wins', body, { 'content-type': 'text/plain' })).status, 415);
   const evil = await c.call('POST', '/api/wins', body, {
     'content-type': 'application/json',
     origin: 'https://evil.example',
   });
   assert.equal(evil.status, 403);
-
   const same = await c.call('POST', '/api/wins', body, { 'content-type': 'application/json', origin: s.base });
   assert.equal(same.status, 201);
-
   assert.equal((await c.call('DELETE', '/api/wins/1')).status, 415); // DELETE without a JSON body
+  const loginForm = await s.client().call('POST', '/api/login', `password=${PASSWORD}`, {
+    'content-type': 'application/x-www-form-urlencoded',
+  });
+  assert.equal(loginForm.status, 415);
 });
 
-test('undo right after tapping removes the win without a trace', async (t) => {
+test('undo on the same device right after tapping leaves no trace', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Hikmat');
+  const c = await s.login();
   const { data } = await c.post('/api/wins', { playerId: s.ids.Ali, method: 'ko1' });
 
   const undo = await c.del(`/api/wins/${data.win.id}`);
@@ -155,49 +167,46 @@ test('undo right after tapping removes the win without a trace', async (t) => {
   assert.equal(undo.data.result, 'undone');
   assert.equal(undo.data.live.standings.find((r) => r.name === 'Ali').points, 0);
   assert.equal(undo.data.live.recent.length, 0);
-
-  const history = await c.get('/api/wins');
-  assert.equal(history.data.wins.length, 0);
+  assert.equal((await c.get('/api/wins')).data.wins.length, 0);
   assert.equal((await c.post(`/api/wins/${data.win.id}/restore`)).status, 404);
 });
 
-test("removing someone else's win is logged in history and can be restored", async (t) => {
+test('removing from another device is shown in history and can be restored', async (t) => {
   const s = await startServer(t);
-  const ali = await s.login('Ali');
-  const ramil = await s.login('Ramil');
-  const { data } = await ali.post('/api/wins', { playerId: s.ids.Ali, method: 'ko1' });
+  const phoneA = await s.login();
+  const phoneB = await s.login();
+  const { data } = await phoneA.post('/api/wins', { playerId: s.ids.Ali, method: 'ko1' });
 
-  const removed = await ramil.del(`/api/wins/${data.win.id}`);
+  const removed = await phoneB.del(`/api/wins/${data.win.id}`);
   assert.equal(removed.data.result, 'removed');
   assert.equal(removed.data.live.standings.find((r) => r.name === 'Ali').points, 0);
 
-  const history = await ali.get('/api/wins');
+  const history = await phoneA.get('/api/wins');
   assert.equal(history.data.wins.length, 1);
-  assert.deepEqual(history.data.wins[0].removed.by, { id: s.ids.Ramil, name: 'Ramil' });
+  assert.equal(typeof history.data.wins[0].removedAt, 'number');
   assert.deepEqual(history.data.totals, { wins: 0, points: 0 });
+  assert.equal((await phoneB.del(`/api/wins/${data.win.id}`)).data.result, 'already-removed');
 
-  assert.equal((await ramil.del(`/api/wins/${data.win.id}`)).data.result, 'already-removed');
-
-  const restored = await ali.post(`/api/wins/${data.win.id}/restore`);
+  const restored = await phoneA.post(`/api/wins/${data.win.id}/restore`);
   assert.equal(restored.status, 200);
-  assert.equal(restored.data.win.removed, null);
+  assert.equal(restored.data.win.removedAt, null);
   assert.equal(restored.data.live.standings.find((r) => r.name === 'Ali').points, 2);
-  assert.equal((await ali.del('/api/wins/424242')).status, 404);
+  assert.equal((await phoneA.del('/api/wins/424242')).status, 404);
 });
 
-test('removing your own win after the undo window is logged too', async (t) => {
+test('removing on the same device after the undo window is shown in history too', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Ibrahim');
+  const c = await s.login();
   const { data } = await c.post('/api/wins', { playerId: s.ids.Ibrahim, method: 'win' });
   s.db.prepare('UPDATE wins SET created_at = ? WHERE id = ?').run(Date.now() - 10 * 60 * 1000, data.win.id);
 
   assert.equal((await c.del(`/api/wins/${data.win.id}`)).data.result, 'removed');
-  assert.equal((await c.get('/api/wins')).data.wins[0].removed.by.name, 'Ibrahim');
+  assert.notEqual((await c.get('/api/wins')).data.wins[0].removedAt, null);
 });
 
 test('board: monthly standings, champions, hall of fame and all-time', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Farrukh');
+  const c = await s.login();
   const current = thisMonth();
   const last = shiftMonth(current, -1);
   const before = shiftMonth(current, -2);
@@ -259,6 +268,7 @@ test('board: monthly standings, champions, hall of fame and all-time', async (t)
 
   assert.equal((await c.get(`/api/board?month=${shiftMonth(current, 1)}`)).status, 400);
   assert.equal((await c.get('/api/board?month=nope')).status, 400);
+  assert.equal((await c.get('/api/board?month=2026-01&month=2026-02')).status, 400);
 
   const live = await c.get('/api/live');
   assert.equal(live.data.reigning.month, last);
@@ -268,19 +278,19 @@ test('board: monthly standings, champions, hall of fame and all-time', async (t)
   );
 });
 
-test('history lists a month newest first with who added it', async (t) => {
+test('history lists a month newest first', async (t) => {
   const s = await startServer(t);
-  const c = await s.login('Ali');
+  const c = await s.login();
   const now = Date.now();
-  insertWin(s.db, { playerId: s.ids.Ramil, month: thisMonth(), createdAt: now - 2000, createdBy: s.ids.Hikmat });
+  insertWin(s.db, { playerId: s.ids.Ramil, month: thisMonth(), createdAt: now - 2000 });
   insertWin(s.db, { playerId: s.ids.Ali, month: thisMonth(), createdAt: now - 1000, method: 'ko1' });
 
   const history = await c.get('/api/wins');
   assert.deepEqual(
-    history.data.wins.map((w) => [w.playerName, w.createdBy.name]),
+    history.data.wins.map((w) => [w.playerName, w.method]),
     [
-      ['Ali', 'Ali'],
-      ['Ramil', 'Hikmat'],
+      ['Ali', 'ko1'],
+      ['Ramil', 'win'],
     ],
   );
   assert.deepEqual(history.data.totals, { wins: 2, points: 3 });
@@ -288,63 +298,44 @@ test('history lists a month newest first with who added it', async (t) => {
   assert.equal(history.data.today, history.data.wins[0].day);
 });
 
-test('changing password needs the current one and logs out other devices', async (t) => {
+test('logout ends that device’s session only', async (t) => {
   const s = await startServer(t);
-  const phone = await s.login('Hikmat');
-  const laptop = await s.login('Hikmat');
-
-  assert.equal(
-    (await phone.post('/api/account/password', { currentPassword: 'wrong', newPassword: 'new-secret' })).status,
-    400,
-  );
-  const short = await phone.post('/api/account/password', { currentPassword: s.passwords.Hikmat, newPassword: '123' });
-  assert.equal(short.status, 400);
-  assert.match(short.data.error, /at least 6/);
-
-  const ok = await phone.post('/api/account/password', {
-    currentPassword: s.passwords.Hikmat,
-    newPassword: 'new-secret',
-  });
-  assert.equal(ok.status, 200);
-  assert.equal((await phone.get('/api/live')).status, 200);
-  assert.equal((await laptop.get('/api/live')).status, 401);
-
-  const c = s.client();
-  assert.equal((await c.post('/api/login', { name: 'Hikmat', password: s.passwords.Hikmat })).status, 401);
-  assert.equal((await c.post('/api/login', { name: 'Hikmat', password: 'new-secret' })).status, 200);
-});
-
-test('logout ends the session', async (t) => {
-  const s = await startServer(t);
-  const c = await s.login('Ramil');
-  const stolenCookie = c.cookie;
-  assert.equal((await c.post('/api/logout')).status, 200);
-  assert.equal(c.cookie, '');
-  assert.equal((await c.get('/api/live')).status, 401);
+  const phone = await s.login();
+  const tablet = await s.login();
+  const stolenCookie = phone.cookie;
+  assert.equal((await phone.post('/api/logout')).status, 200);
+  assert.equal(phone.cookie, '');
+  assert.equal((await phone.get('/api/live')).status, 401);
   assert.equal((await s.client().call('GET', '/api/live', undefined, { cookie: stolenCookie })).status, 401);
+  assert.equal((await tablet.get('/api/live')).status, 200);
 });
 
-test('players removed from PLAYERS keep their history but cannot log in', async (t) => {
+test('a new APP_PASSWORD at restart logs every device out; the old one stops working', async (t) => {
   const s = await startServer(t);
-  const ali = await s.login('Ali');
-  await ali.post('/api/wins', { playerId: s.ids.Ali, method: 'win' });
+  const phone = await s.login();
 
-  // Simulate restarting with Ali taken off the list.
-  const { syncPlayers } = require('../src/db');
-  syncPlayers(s.db, ['Farrukh', 'Ramil', 'Ibrahim', 'Hikmat'], {
-    hashPassword: () => 'x',
-    generatePassword: () => 'x',
-  });
+  // What server.js does at startup with the configured password:
+  assert.equal(applyLoginPassword(s.db, 'brand-new-pass').status, 'changed');
+  assert.equal(applyLoginPassword(s.db, 'brand-new-pass').status, 'unchanged');
 
-  assert.equal((await ali.get('/api/live')).status, 401);
-  assert.equal((await s.client().post('/api/login', { name: 'Ali', password: s.passwords.Ali })).status, 401);
-  const ramil = await s.login('Ramil');
+  assert.equal((await phone.get('/api/live')).status, 401);
+  assert.equal((await s.client().post('/api/login', { password: PASSWORD })).status, 401);
+  assert.equal((await s.client().post('/api/login', { password: 'brand-new-pass' })).status, 200);
+});
+
+test('players removed from PLAYERS keep their points but cannot be picked', async (t) => {
+  const s = await startServer(t);
+  const c = await s.login();
+  await c.post('/api/wins', { playerId: s.ids.Ali, method: 'win' });
+
+  syncPlayers(s.db, ['Farrukh', 'Ramil', 'Ibrahim', 'Hikmat']); // as on a restart without Ali
+
   assert.deepEqual(
-    (await ramil.get('/api/session')).data.players.map((p) => p.name),
+    (await c.get('/api/session')).data.players.map((p) => p.name),
     ['Farrukh', 'Ramil', 'Ibrahim', 'Hikmat'],
   );
-  assert.equal((await ramil.post('/api/wins', { playerId: s.ids.Ali, method: 'win' })).status, 400);
-  const standings = (await ramil.get('/api/live')).data.standings;
+  assert.equal((await c.post('/api/wins', { playerId: s.ids.Ali, method: 'win' })).status, 400);
+  const standings = (await c.get('/api/live')).data.standings;
   assert.equal(standings.find((r) => r.name === 'Ali').points, 1); // still counted this month
 });
 
@@ -352,7 +343,7 @@ test('pages, manifest, health check and security headers', async (t) => {
   const s = await startServer(t, { APP_NAME: 'Zaq <Fight> Club' });
   const c = s.client();
 
-  for (const page of ['/', '/login', '/register', '/history', '/account']) {
+  for (const page of ['/', '/login', '/register', '/history', '/rules']) {
     const res = await c.get(page);
     assert.equal(res.status, 200, page);
     assert.match(res.data, /<title>Zaq &lt;Fight&gt; Club<\/title>/);
@@ -379,8 +370,8 @@ test('pages, manifest, health check and security headers', async (t) => {
     assert.doesNotMatch(String(res.data), /better-sqlite3|CREATE TABLE/, sneaky);
   }
   assert.equal((await c.get('/api/nope')).status, 401); // logged out: hits the login wall first
-  assert.equal((await (await s.login('Ali')).get('/api/nope')).status, 404);
+  assert.equal((await (await s.login()).get('/api/nope')).status, 404);
   assert.equal((await c.get('/somewhere')).status, 302);
-  assert.equal((await c.get('/api/live')).headers.get('cache-control'), 'no-store');
+  assert.equal((await c.get('/api/session')).headers.get('cache-control'), 'no-store');
   assert.equal((await c.call('POST', '/api/login', '{bad json', { 'content-type': 'application/json' })).status, 400);
 });

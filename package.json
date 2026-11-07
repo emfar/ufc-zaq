@@ -9,8 +9,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test": "node --test test/*.test.js",
-    "set-password": "node scripts/set-password.js",
-    "backup": "node scripts/backup.js"
+    "backup": "node scripts/backup.js",
+    "lint": "prettier --no-error-on-unmatched-pattern --check \"src/**/*.js\" \"scripts/**/*.js\" \"test/**/*.js\" \"public/js/**/*.js\" \"public/css/**/*.css\" \".github/**/*.yml\" \"deploy/**/*.yml\"",
+    "format": "prettier --no-error-on-unmatched-pattern --write \"src/**/*.js\" \"scripts/**/*.js\" \"test/**/*.js\" \"public/js/**/*.js\" \"public/css/**/*.css\" \".github/**/*.yml\" \"deploy/**/*.yml\""
   },
   "engines": {
     "node": ">=22"
@@ -18,5 +19,8 @@
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.10"
   }
 }
