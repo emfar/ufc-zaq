@@ -1,0 +1,64 @@
+# Production stack on the server, in /opt/ufc-zaq. GitHub Actions copies this
+# file there with Caddyfile and remote-deploy.sh, writes app_password (the shared
+# login password) and runs remote-deploy.sh, which writes .env: APP_IMAGE,
+# DOMAIN and the optional APP_NAME, TIMEZONE, PLAYERS, SESSION_DAYS.
+name: ufc-zaq
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+
+services:
+  app:
+    image: ${APP_IMAGE:?APP_IMAGE is not set - deploy with remote-deploy.sh}
+    init: true
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD_FILE: /run/secrets/app_password
+      TRUST_PROXY: '1'
+      # Empty values mean "use the app's default"
+      APP_NAME: ${APP_NAME:-}
+      TIMEZONE: ${TIMEZONE:-}
+      PLAYERS: ${PLAYERS:-}
+      SESSION_DAYS: ${SESSION_DAYS:-}
+    secrets:
+      - app_password
+    volumes:
+      - app-data:/app/data
+    # No published ports: only Caddy reaches the app, over the compose network.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is not set - deploy with remote-deploy.sh}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: *logging
+
+secrets:
+  app_password:
+    file: ./app_password
+
+volumes:
+  app-data: # the scoreboard database and its backups
+  caddy-data: # HTTPS certificates
+  caddy-config:

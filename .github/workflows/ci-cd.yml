@@ -1,0 +1,398 @@
+name: CI/CD
+
+# Every push and pull request: lint, test and build the Docker image (amd64 only).
+# Push to the default branch: also publish ghcr.io/<owner>/<repo>:sha-<short sha>
+# and :latest (amd64 + arm64) and deploy that image to the server.
+# Actions > CI/CD > Run workflow: redeploy the chosen branch's commit, or give
+# image_tag (e.g. sha-1a2b3c4) to deploy an earlier image without building (rollback).
+# One-time setup: deploy/server-setup.sh, then the secrets listed in the deploy job.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to deploy without building, e.g. sha-1a2b3c4 (rollback). Empty: redeploy the image of the chosen branch's last commit."
+        type: string
+        required: false
+        default: ''
+
+permissions: {}
+
+concurrency:
+  # A newer push cancels the run for the same branch or PR; runs that may deploy are never cancelled.
+  group: ${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Lint and test
+    if: github.event_name != 'workflow_dispatch' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  image:
+    name: Docker image
+    needs: test
+    if: github.event_name != 'workflow_dispatch' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Only pushes to the default branch publish the image.
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Image name and tag
+        id: name
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: env.PUBLISH == 'true'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Labels and tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.name.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build (amd64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ufc-zaq:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (the container must report healthy)
+        run: |
+          printf 'smoke-test-password\n' > "$RUNNER_TEMP/app_password"
+          chmod 644 "$RUNNER_TEMP/app_password"
+          # Same restrictions as deploy/docker-compose.yml
+          docker run --detach --name smoke --init --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges --mount type=volume,dst=/app/data \
+            --volume "$RUNNER_TEMP/app_password:/run/secrets/app_password:ro" \
+            --env APP_PASSWORD_FILE=/run/secrets/app_password --env TRUST_PROXY=1 ufc-zaq:ci
+          status=""
+          for _ in $(seq 60); do
+            status=$(docker inspect --format '{{.State.Status}} {{.State.Health.Status}}' smoke)
+            case $status in
+              'running healthy') break ;;
+              'running starting') sleep 1 ;;
+              *) break ;;
+            esac
+          done
+          docker logs smoke
+          if [ "$status" != 'running healthy' ]; then
+            echo "::error title=Smoke test::The container did not become healthy (state: $status)"
+            exit 1
+          fi
+
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy
+    needs: [test, image]
+    # needs are skipped for a rollback (image_tag), so this must not rely on the default success()
+    if: >-
+      !failure() && !cancelled() && (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      # Repository variables (Settings > Secrets and variables > Actions > Variables) override these defaults.
+      # Secrets needed: SSH_PRIVATE_KEY and SSH_KNOWN_HOSTS (printed by deploy/server-setup.sh), APP_PASSWORD.
+      SSH_HOST: ${{ vars.SSH_HOST || '94.20.57.239' }}
+      SSH_USER: ${{ vars.SSH_USER || 'deploy' }}
+      SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+      DOMAIN: ${{ vars.DOMAIN || 'zufc.asaim.tech' }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      TIMEZONE: ${{ vars.TIMEZONE }}
+      PLAYERS: ${{ vars.PLAYERS }}
+      SESSION_DAYS: ${{ vars.SESSION_DAYS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Check settings
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          fail() {
+            echo "::error title=Settings::$*"
+            exit 1
+          }
+          [[ $DOMAIN =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "DOMAIN must be a host name such as ufc.example.com"
+          [[ $SSH_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || fail "SSH_HOST must be an IP address or a host name"
+          [[ $SSH_PORT =~ ^[0-9]{1,5}$ ]] || fail "SSH_PORT must be a port number"
+          [[ $SSH_USER =~ ^[A-Za-z0-9._-]+$ ]] || fail "SSH_USER must be a plain user name"
+          tag=${IMAGE_TAG//[[:space:]]/}
+          tag=${tag:-sha-${GITHUB_SHA::7}}
+          [[ $tag =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || fail "image_tag must be an image tag such as sha-1a2b3c4"
+          echo "IMAGE_REF=ghcr.io/${GITHUB_REPOSITORY,,}:$tag" >> "$GITHUB_ENV"
+
+      - name: Diagnostics (DNS, open ports, SSH host keys)
+        continue-on-error: true
+        run: |
+          set +e
+          ipv4() { getent ahostsv4 "$1" | awk '{print $1}' | sort -u | xargs; }
+          server=$(ipv4 "$SSH_HOST")
+          a=$(ipv4 "$DOMAIN")
+          aaaa=$(getent ahostsv6 "$DOMAIN" | awk '$1 !~ /^::ffff:/ {print $1}' | sort -u | xargs)
+          echo "Server $SSH_HOST (${server:-does not resolve}), domain $DOMAIN"
+          echo "  DNS A    $DOMAIN -> ${a:-none}"
+          echo "  DNS AAAA $DOMAIN -> ${aaaa:-none}"
+          if [ -z "$a" ]; then
+            echo "::warning title=DNS::$DOMAIN has no A record. Point it to ${server:-$SSH_HOST}, or HTTPS cannot work."
+          elif [ "$a" != "$server" ]; then
+            echo "::warning title=DNS::$DOMAIN points to $a, not to the server (${server:-$SSH_HOST}). Fix its A record."
+          fi
+          if [ -n "$aaaa" ]; then
+            echo "::warning title=DNS::$DOMAIN has an IPv6 (AAAA) record ($aaaa). It must reach the same server, or delete it."
+          fi
+          # shellcheck disable=SC2016 # host and port are passed as $0 and $1
+          tcp() { timeout 5 bash -c 'exec 3<> "/dev/tcp/$0/$1"' "$SSH_HOST" "$1" 2> /dev/null; }
+          for port in $(printf '%s\n' 22 "$SSH_PORT" 80 443 | sort -un); do
+            tcp "$port"
+            case $? in
+              0) echo "  TCP $port: open" ;;
+              124) echo "  TCP $port: no answer (a firewall?)" ;;
+              *) echo "  TCP $port: closed (nothing listening yet?)" ;;
+            esac
+          done
+          echo "SSH host keys of $SSH_HOST port $SSH_PORT (compare with the SSH_KNOWN_HOSTS secret):"
+          ssh-keyscan -T 10 -p "$SSH_PORT" "$SSH_HOST" 2> /dev/null | ssh-keygen -lf - || echo "  could not read them"
+          exit 0
+
+      - name: Check secrets
+        id: secrets
+        env:
+          HAVE_SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY != '' }}
+          HAVE_SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS != '' }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          LC_ALL: C.UTF-8
+        run: |
+          missing=()
+          [ "$HAVE_SSH_PRIVATE_KEY" = true ] || missing+=(SSH_PRIVATE_KEY)
+          [ "$HAVE_SSH_KNOWN_HOSTS" = true ] || missing+=(SSH_KNOWN_HOSTS)
+          if [ -z "$APP_PASSWORD" ]; then
+            missing+=(APP_PASSWORD)
+          else
+            pw=$APP_PASSWORD
+            while [[ $pw == *[$'\r\n'] ]]; do pw=${pw%?}; done
+            if [[ $pw == *[$'\r\n']* ]] || ((${#pw} < 8)); then
+              echo "::error title=APP_PASSWORD::The APP_PASSWORD secret must be one line of at least 8 characters. Update it and run the workflow again."
+              exit 1
+            fi
+          fi
+          if ((${#missing[@]})); then
+            msg="Not deployed yet: add the repository secrets ${missing[*]} (Settings > Secrets and variables > Actions). README.md explains how; deploy/server-setup.sh prints the SSH values."
+            echo "::warning title=Deploy skipped::$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to ghcr.io
+        if: steps.secrets.outputs.ready == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check that the image exists
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          if ! docker manifest inspect "$IMAGE_REF" > /dev/null; then
+            packages="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pkgs/container/${GITHUB_REPOSITORY#*/}"
+            echo "::error title=Image not found::$IMAGE_REF does not exist. Only pushes to the default branch publish images; for a rollback pick a sha-... tag from $packages"
+            exit 1
+          fi
+
+      - name: Set up SSH
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          dir="$RUNNER_TEMP/deploy-ssh"
+          mkdir -p "$dir"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$dir/id"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" | tr -d '\r' > "$dir/known_hosts"
+          host=$SSH_HOST
+          [ "$SSH_PORT" = 22 ] || host="[$SSH_HOST]:$SSH_PORT"
+          if ! ssh-keygen -F "$host" -f "$dir/known_hosts" > /dev/null; then
+            echo "::error title=SSH_KNOWN_HOSTS::The SSH_KNOWN_HOSTS secret has no line for $host. Use the SSH_KNOWN_HOSTS block printed by deploy/server-setup.sh."
+            exit 1
+          fi
+          cat > "$dir/config" << EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile "$dir/id"
+            IdentitiesOnly yes
+            UserKnownHostsFile "$dir/known_hosts"
+            GlobalKnownHostsFile /dev/null
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 20
+            ConnectionAttempts 3
+            ServerAliveInterval 15
+            ServerAliveCountMax 4
+          EOF
+          echo "SSH_CONFIG=$dir/config" >> "$GITHUB_ENV"
+          if ! ssh -F "$dir/config" server true; then
+            echo "::error title=SSH::Cannot log in as $SSH_USER@$SSH_HOST (port $SSH_PORT). Check the SSH_PRIVATE_KEY secret and that deploy/server-setup.sh ran on the server."
+            exit 1
+          fi
+
+      # Everything goes to the server over stdin (no scp/sftp), so the "restrict"
+      # option on the deploy key in authorized_keys keeps working.
+      - name: Upload docker-compose.yml, Caddyfile and remote-deploy.sh
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          tar -C deploy -cf - docker-compose.yml Caddyfile remote-deploy.sh |
+            ssh -F "$SSH_CONFIG" server 'set -e
+              cd /opt/ufc-zaq 2> /dev/null || { echo "/opt/ufc-zaq is missing: run deploy/server-setup.sh on the server" >&2; exit 1; }
+              rm -rf .upload && mkdir .upload && tar -xf - -C .upload
+              chmod 644 .upload/* && mv -f .upload/* . && rmdir .upload'
+
+      - name: Write the login password
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          # Only stdin carries the password: it is never in a command line, an environment or a log.
+          # Mode 644 lets the app (uid 1000 in its container) read it through the compose secret,
+          # while /opt/ufc-zaq itself (mode 700) keeps other users on the server out.
+          pw=$APP_PASSWORD
+          while [[ $pw == *[$'\r\n'] ]]; do pw=${pw%?}; done
+          printf '%s\n' "$pw" | ssh -F "$SSH_CONFIG" server \
+            'cd /opt/ufc-zaq && umask 077 && cat > .app_password.new && chmod 644 .app_password.new && mv -f .app_password.new app_password'
+
+      - name: Log in to ghcr.io on the server
+        id: login
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s\n' "$REGISTRY_TOKEN" |
+            ssh -F "$SSH_CONFIG" server "docker login ghcr.io --username $(printf %q "$REGISTRY_USER") --password-stdin"
+
+      - name: Deploy
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          remote="cd /opt/ufc-zaq &&"
+          for name in DOMAIN APP_NAME TIMEZONE PLAYERS SESSION_DAYS; do
+            remote+=" $name=$(printf %q "${!name}")"
+          done
+          remote+=" bash remote-deploy.sh $(printf %q "$IMAGE_REF")"
+          ssh -F "$SSH_CONFIG" server "$remote"
+
+      - name: Log out of ghcr.io on the server
+        if: always() && steps.login.outcome != 'skipped'
+        run: |
+          ssh -F "$SSH_CONFIG" server 'docker logout ghcr.io' ||
+            echo "::warning::docker logout on the server failed (the token stops working when this job ends anyway)"
+
+      - name: Check https://${{ env.DOMAIN }}/healthz
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          url="https://$DOMAIN/healthz"
+          # shellcheck disable=SC2016 # host and port are passed as $0 and $1
+          tcp() { timeout 5 bash -c 'exec 3<> "/dev/tcp/$0/$1"' "$SSH_HOST" "$1" 2> /dev/null; }
+          echo "The app is healthy on the server; waiting for $url (the first HTTPS certificate can take a minute or two)"
+          deadline=$((SECONDS + 180))
+          until result=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>&1) && [ "$result" = 200 ]; do
+            if ((SECONDS >= deadline)); then
+              echo "::error title=Not reachable::The app runs on the server, but $url does not answer (last result: $result). Nothing was rolled back; see the diagnostics below."
+              echo "DNS A of $DOMAIN: $(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u | xargs) (server: $SSH_HOST)"
+              for port in 80 443; do
+                if tcp "$port"; then
+                  echo "TCP $port: open"
+                else
+                  echo "TCP $port: not reachable"
+                fi
+              done
+              echo "Containers and the last Caddy log lines:"
+              ssh -F "$SSH_CONFIG" server 'cd /opt/ufc-zaq && docker compose ps && docker compose logs --no-color --tail 40 caddy' || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::notice title=Deployed::$IMAGE_REF is live at https://$DOMAIN"
+          echo "Deployed \`$IMAGE_REF\` to https://$DOMAIN" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/deploy-ssh"
