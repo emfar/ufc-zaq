@@ -132,10 +132,12 @@ compose logs --no-color --tail 100 app || true
 if [[ -z $previous_env || $previous_env == "$new_env" ]]; then
   die "deploy of $image failed, and there is no other version to roll back to"
 fi
-log "Rolling back to ${previous_image:-the previous settings}"
+target=$previous_image
+[[ $previous_image != "$image" ]] || target="the previous settings"
+log "Rolling back to $target"
 printf '%s\n' "$previous_env" > .env
 if compose up --detach --remove-orphans --force-recreate && wait_healthy; then
   compose ps
-  die "deploy of $image failed - rolled back to ${previous_image:-the previous settings}"
+  die "deploy of $image failed - rolled back to $target"
 fi
-die "deploy of $image failed, and the rollback to ${previous_image:-the previous settings} is not healthy either"
+die "deploy of $image failed, and the rollback to $target is not healthy either"
