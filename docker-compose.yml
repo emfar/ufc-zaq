@@ -1,0 +1,46 @@
+# Production setup: the app + Caddy, which gets and renews the HTTPS
+# certificate for your subdomain automatically.
+#
+#   cp .env.example .env     # then set DOMAIN
+#   docker compose up -d --build
+#
+# Already running nginx/another proxy on this server? Start only the app
+# (`docker compose up -d --build app`) and proxy your subdomain to 127.0.0.1:3000.
+
+services:
+  app:
+    build: .
+    image: ufc-zaq
+    restart: unless-stopped
+    init: true
+    environment:
+      # Empty values fall back to the defaults in src/config.js
+      APP_NAME: ${APP_NAME:-}
+      TIMEZONE: ${TIMEZONE:-}
+      PLAYERS: ${PLAYERS:-}
+      TRUST_PROXY: '1'
+    volumes:
+      - app-data:/app/data
+    ports:
+      - '127.0.0.1:3000:3000' # reachable from this server only
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  app-data: # the scoreboard database — back it up (see README)
+  caddy-data:
+  caddy-config:
