@@ -28,78 +28,54 @@ later, or from another phone, stay in History and can be restored.
 
 ## The club password
 
-Everyone logs in with the same password. Only the admin sets it: it's the
-`APP_PASSWORD` secret in GitHub (see below), applied on every deploy.
+Everyone logs in with the same password. Whoever deploys the app sets it: it's
+the `APP_PASSWORD` secret in GitHub (see below), applied on every deploy.
 Changing it logs every phone out, so it's also how you kick everyone out.
 
 Running the app without a password configured (e.g. on your computer) makes it
 generate one on first start and print it in the log.
 
-## Deployment: GitHub Actions → the shared server
+## Deploy on your own VPS (GitHub Actions)
 
 Every push to the repository's default branch runs the checks, builds a Docker
-image (stored privately in GitHub's container registry) and deploys it to the
-server over SSH. Before each deploy the database is backed up on the server
-(the newest 20 backups are kept); if the new version doesn't come up healthy,
-the previous one is put back automatically. Pull requests and other branches
-only run the checks.
+image (stored privately in the repository's GitHub container registry,
+`ghcr.io/<owner>/<repo>`) and deploys it to the VPS over SSH. The VPS runs the
+app plus [Caddy](https://caddyserver.com), which gets and renews the HTTPS
+certificate on its own. Before each deploy the database is backed up on the
+server (the newest 20 backups are kept); if the new version doesn't come up
+healthy, the previous one is put back automatically. Pull requests and other
+branches only run the checks.
 
-**How it fits on the server.** The server is shared (asaim-main, asaim-test,
-later asaim-learn, and zufc). HTTPS for all of them is handled by the one Caddy
-container of the `fincert-asm` stack (`fincert-asm-caddy-1`, ports 80/443).
-zufc runs only its app container, in `/opt/zufc`, with no ports of its own; the
-Caddy reaches it as `zufc-app:3000` over a shared Docker network called `edge`.
-The zufc container can't see the other projects' private networks (their
-databases).
+You need:
 
-> Anything that joins `edge` must use a **unique service name** (like
-> `zufc-app`): every name on `edge` is visible to Caddy, so a second service
-> called `app` would hijack routes such as `reverse_proxy app:8000`.
+- a VPS with Ubuntu 22.04/24.04 or Debian 12 (x86-64 or ARM — the smallest
+  size is plenty), reachable on ports 22, 80 and 443;
+- a domain or subdomain for the app, e.g. `ufc.example.com`;
+- admin rights on the GitHub repository that runs the workflow, to add secrets.
+  Deploying from your own copy of this repository? Then do everything below in
+  your copy; its images go to your own `ghcr.io`.
 
 ### One-time setup
 
-1. **DNS:** `zufc.asaim.tech` → `94.20.57.239` (an **A** record). ✔ done.
+1. **DNS:** create an **A** record for your domain pointing at the VPS's IP.
 2. **Server:** log in as root over SSH and paste the contents of
-   [`deploy/server-setup.sh`](deploy/server-setup.sh). It creates the `zufc`
-   user (SSH key only) and `/opt/zufc`, creates the `edge` network and attaches
-   the Caddy to it, adds the `zufc.asaim.tech` site to that Caddy's Caddyfile —
-   validated first, the original kept as `Caddyfile.before-zufc` — and reloads
-   Caddy without downtime. It prints `SSH_PRIVATE_KEY` and `SSH_KNOWN_HOSTS`.
-   Safe to run again.
-3. **GitHub:** repo → *Settings* → *Secrets and variables* → *Actions* →
-   *New repository secret*, three times:
-   - `SSH_PRIVATE_KEY` — from step 2
-   - `SSH_KNOWN_HOSTS` — from step 2
-   - `APP_PASSWORD` — the club password you choose (at least 8 characters)
-4. **Deploy:** *Actions* → *CI/CD* → *Run workflow* (or push a commit), then
-   open `https://zufc.asaim.tech`.
-5. **Keep it in the fincert-asm repo** so asaim deploys don't undo step 2.
-   Add the site to its Caddyfile:
+   [`deploy/server-setup.sh`](deploy/server-setup.sh) (or copy the file over and
+   run `bash server-setup.sh`). It installs Docker, creates the `deploy` user
+   (SSH key only) and `/opt/ufc-zaq`, opens ports 80/443 if the ufw firewall is
+   on, and prints `SSH_PRIVATE_KEY` and `SSH_KNOWN_HOSTS`. It's safe to run
+   again. If it warns that ports 80/443 are in use, see
+   [Already running a web server?](#already-running-a-web-server-on-ports-80443)
+3. **GitHub:** repository → *Settings* → *Secrets and variables* → *Actions*:
+   - **Secrets:** `SSH_PRIVATE_KEY` and `SSH_KNOWN_HOSTS` (both from step 2), and
+     `APP_PASSWORD` — the club password you choose (at least 8 characters).
+   - **Variables:** `SSH_HOST` — the VPS's IP or host name, and `DOMAIN` — the
+     app's address, e.g. `ufc.example.com`.
+4. **Deploy:** *Actions* → *CI/CD* → *Run workflow* (or push a commit). The
+   first certificate takes a minute; then open `https://<your domain>`.
 
-   ```
-   zufc.asaim.tech {
-   	encode zstd gzip
-   	reverse_proxy zufc-app:3000
-   }
-   ```
-
-   and put its `caddy` service on the shared network in its compose file
-   (keep `default` so asaim keeps working):
-
-   ```yaml
-   services:
-     caddy:
-       networks:
-         - default
-         - edge
-
-   networks:
-     edge:
-       external: true
-   ```
-
-   Until then every zufc deploy re-attaches the Caddy to `edge` if needed and
-   warns if the site is missing from the Caddyfile (re-run step 2 to add it).
+Until those secrets and variables exist, the deploy step is skipped with a note
+saying what's missing. Every run also prints DNS and port diagnostics for the
+server, which helps with the first deploy.
 
 ### Everyday use
 
@@ -111,27 +87,73 @@ databases).
 
 ### Settings
 
-Optional repository **variables** (*Settings* → *Secrets and variables* →
-*Actions* → *Variables*):
+Repository **variables** (*Settings* → *Secrets and variables* → *Actions* →
+*Variables*):
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DOMAIN` | `zufc.asaim.tech` | The address the app is served on (also change it in the Caddyfile) |
-| `SSH_HOST` | `94.20.57.239` | Server to deploy to |
-| `SSH_USER` | `zufc` | SSH user created by the setup script |
-| `SSH_PORT` | `22` | SSH port |
+| `SSH_HOST` | — (required) | The VPS to deploy to: IP address or host name |
+| `DOMAIN` | — (required) | The address the app is served on |
+| `SSH_USER` | `deploy` | SSH user created by the setup script |
+| `SSH_PORT` | `22` | SSH port of the VPS |
 | `APP_NAME` | `UFC ZAQ` | Name in the header, login screen and home-screen icon |
 | `TIMEZONE` | `Asia/Baku` | Months start and end at midnight in this time zone |
 | `PLAYERS` | `Farrukh,Ramil,Ibrahim,Hikmat,Ali` | The fighters, in button order. Add a name to add a fighter; removing a name hides them but keeps their history. Don't rename here — that creates a new fighter. |
 
-### On the server
+### Already running a web server on ports 80/443?
 
-Everything lives in `/opt/zufc`; the data is in the `zufc_app-data` Docker volume.
+The bundled Caddy needs ports 80 and 443. If the VPS already runs a web server
+(nginx, Caddy, Traefik…), let that one serve the app instead:
+
+1. In [`deploy/docker-compose.yml`](deploy/docker-compose.yml), delete the
+   `caddy` service and give the `app` service a local-only port:
+
+   ```yaml
+       ports:
+         - '127.0.0.1:3000:3000'
+   ```
+
+2. Point your domain at `http://127.0.0.1:3000` in that web server and pass on
+   the original host and protocol. For nginx, in the `server` block of your
+   domain:
+
+   ```nginx
+   location / {
+       proxy_pass http://127.0.0.1:3000;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+   }
+   ```
+
+The deploy script notices that the `caddy` service is gone and skips it.
+
+### Without GitHub Actions
+
+To deploy by hand instead, run this on the VPS as root after step 2 above
+(or on any server with Docker):
 
 ```bash
-cd /opt/zufc && docker compose logs --tail 50 zufc-app      # app log
-docker compose exec zufc-app node scripts/backup.js         # extra backup
-docker compose cp zufc-app:/app/data/backups ./backups      # copy backups out
+git clone https://github.com/emfar/ufc-zaq.git /root/ufc-zaq && cd /root/ufc-zaq
+docker build -t ufc-zaq:local .
+install -d -m 700 /opt/ufc-zaq
+cp deploy/docker-compose.yml deploy/Caddyfile deploy/remote-deploy.sh /opt/ufc-zaq/
+read -rsp 'Club password: ' pw && printf '%s' "$pw" > /opt/ufc-zaq/app_password && unset pw
+DOMAIN=ufc.example.com SKIP_PULL=1 bash /opt/ufc-zaq/remote-deploy.sh ufc-zaq:local
+```
+
+To update later: `git pull`, build again, copy the `deploy/` files again and
+rerun the last command.
+
+### On the server
+
+Everything lives in `/opt/ufc-zaq`; the data is in the `ufc-zaq_app-data`
+Docker volume.
+
+```bash
+cd /opt/ufc-zaq && docker compose logs --tail 50 app       # app log
+docker compose exec app node scripts/backup.js             # extra backup
+docker compose cp app:/app/data/backups ./backups          # copy backups out
 ```
 
 ## Run it on your computer
@@ -158,6 +180,6 @@ src/                 server: config, database, login, scoring rules, API
 public/              the mobile web app (HTML, CSS, JS modules, icons, font)
 scripts/backup.js    consistent database backup
 test/                node:test suites — `npm test`
-deploy/              server setup, deploy script, production docker compose
+deploy/              server setup, deploy script, production docker compose + Caddyfile
 .github/workflows/   CI/CD
 ```

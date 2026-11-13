@@ -5,7 +5,7 @@ name: CI/CD
 # and :latest (amd64 + arm64) and deploy that image to the server.
 # Actions > CI/CD > Run workflow: redeploy the chosen branch's commit, or give
 # image_tag (e.g. sha-1a2b3c4) to deploy an earlier image without building (rollback).
-# One-time setup: deploy/server-setup.sh, then the secrets listed in the deploy job.
+# One-time setup: deploy/server-setup.sh, then the secrets and variables listed in the deploy job (see README).
 
 on:
   push:
@@ -163,12 +163,14 @@ jobs:
       group: deploy-production
       cancel-in-progress: false
     env:
-      # Repository variables (Settings > Secrets and variables > Actions > Variables) override these defaults.
+      # Repository variables (Settings > Secrets and variables > Actions > Variables).
+      # Required: SSH_HOST (the VPS) and DOMAIN (the app's address).
+      # Optional: SSH_USER, SSH_PORT, APP_NAME, TIMEZONE, PLAYERS, SESSION_DAYS.
       # Secrets needed: SSH_PRIVATE_KEY and SSH_KNOWN_HOSTS (printed by deploy/server-setup.sh), APP_PASSWORD.
-      SSH_HOST: ${{ vars.SSH_HOST || '94.20.57.239' }}
-      SSH_USER: ${{ vars.SSH_USER || 'zufc' }}
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_USER: ${{ vars.SSH_USER || 'deploy' }}
       SSH_PORT: ${{ vars.SSH_PORT || '22' }}
-      DOMAIN: ${{ vars.DOMAIN || 'zufc.asaim.tech' }}
+      DOMAIN: ${{ vars.DOMAIN }}
       APP_NAME: ${{ vars.APP_NAME }}
       TIMEZONE: ${{ vars.TIMEZONE }}
       PLAYERS: ${{ vars.PLAYERS }}
@@ -187,8 +189,8 @@ jobs:
             echo "::error title=Settings::$*"
             exit 1
           }
-          [[ $DOMAIN =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "DOMAIN must be a host name such as ufc.example.com"
-          [[ $SSH_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || fail "SSH_HOST must be an IP address or a host name"
+          [[ -z $DOMAIN || $DOMAIN =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "DOMAIN must be a host name such as ufc.example.com"
+          [[ -z $SSH_HOST || $SSH_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || fail "SSH_HOST must be an IP address or a host name"
           [[ $SSH_PORT =~ ^[0-9]{1,5}$ ]] || fail "SSH_PORT must be a port number"
           [[ $SSH_USER =~ ^[A-Za-z0-9._-]+$ ]] || fail "SSH_USER must be a plain user name"
           tag=${IMAGE_TAG//[[:space:]]/}
@@ -197,6 +199,7 @@ jobs:
           echo "IMAGE_REF=ghcr.io/${GITHUB_REPOSITORY,,}:$tag" >> "$GITHUB_ENV"
 
       - name: Diagnostics (DNS, open ports, SSH host keys)
+        if: env.SSH_HOST != '' && env.DOMAIN != ''
         continue-on-error: true
         run: |
           set +e
@@ -229,7 +232,7 @@ jobs:
           ssh-keyscan -T 10 -p "$SSH_PORT" "$SSH_HOST" 2> /dev/null | ssh-keygen -lf - || echo "  could not read them"
           exit 0
 
-      - name: Check secrets
+      - name: Check secrets and variables
         id: secrets
         env:
           HAVE_SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY != '' }}
@@ -250,8 +253,14 @@ jobs:
               exit 1
             fi
           fi
-          if ((${#missing[@]})); then
-            msg="Not deployed yet: add the repository secrets ${missing[*]} (Settings > Secrets and variables > Actions). README.md explains how; deploy/server-setup.sh prints the SSH values."
+          missing_vars=()
+          [ -n "$SSH_HOST" ] || missing_vars+=(SSH_HOST)
+          [ -n "$DOMAIN" ] || missing_vars+=(DOMAIN)
+          if ((${#missing[@]} + ${#missing_vars[@]})); then
+            msg="Not deployed yet. Add in Settings > Secrets and variables > Actions:"
+            ((${#missing[@]} == 0)) || msg+=" secrets ${missing[*]};"
+            ((${#missing_vars[@]} == 0)) || msg+=" variables ${missing_vars[*]};"
+            msg+=" README.md explains how, and deploy/server-setup.sh prints the SSH values."
             echo "::warning title=Deploy skipped::$msg"
             echo "$msg" >> "$GITHUB_STEP_SUMMARY"
             echo "ready=false" >> "$GITHUB_OUTPUT"
@@ -286,11 +295,14 @@ jobs:
           dir="$RUNNER_TEMP/deploy-ssh"
           mkdir -p "$dir"
           printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$dir/id"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" | tr -d '\r' > "$dir/known_hosts"
           host=$SSH_HOST
           [ "$SSH_PORT" = 22 ] || host="[$SSH_HOST]:$SSH_PORT"
-          if ! ssh-keygen -F "$host" -f "$dir/known_hosts" > /dev/null; then
-            echo "::error title=SSH_KNOWN_HOSTS::The SSH_KNOWN_HOSTS secret has no line for $host. Use the SSH_KNOWN_HOSTS block printed by deploy/server-setup.sh."
+          # The secret holds the server's host keys ("ssh-ed25519 AAAA..." per line, as
+          # deploy/server-setup.sh prints them); a host name in front of a key is ignored.
+          printf '%s\n' "$SSH_KNOWN_HOSTS" | tr -d '\r' |
+            awk -v host="$host" '{for (i = 1; i < NF; i++) if ($i ~ /^(ssh-|ecdsa-|sk-)/) {print host, $i, $(i + 1); next}}' > "$dir/known_hosts"
+          if [ ! -s "$dir/known_hosts" ]; then
+            echo "::error title=SSH_KNOWN_HOSTS::The SSH_KNOWN_HOSTS secret contains no host keys. Paste the SSH_KNOWN_HOSTS block printed by deploy/server-setup.sh."
             exit 1
           fi
           cat > "$dir/config" << EOF
@@ -317,12 +329,12 @@ jobs:
 
       # Everything goes to the server over stdin (no scp/sftp), so the "restrict"
       # option on the deploy key in authorized_keys keeps working.
-      - name: Upload docker-compose.yml and remote-deploy.sh
+      - name: Upload docker-compose.yml, Caddyfile and remote-deploy.sh
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          tar -C deploy -cf - docker-compose.yml remote-deploy.sh |
+          tar -C deploy -cf - docker-compose.yml Caddyfile remote-deploy.sh |
             ssh -F "$SSH_CONFIG" server 'set -e
-              cd /opt/zufc 2> /dev/null || { echo "/opt/zufc is missing: run deploy/server-setup.sh on the server" >&2; exit 1; }
+              cd /opt/ufc-zaq 2> /dev/null || { echo "/opt/ufc-zaq is missing: run deploy/server-setup.sh on the server" >&2; exit 1; }
               rm -rf .upload && mkdir .upload && tar -xf - -C .upload
               chmod 644 .upload/* && mv -f .upload/* . && rmdir .upload'
 
@@ -333,11 +345,11 @@ jobs:
         run: |
           # Only stdin carries the password: it is never in a command line, an environment or a log.
           # Mode 644 lets the app (uid 1000 in its container) read it through the compose secret,
-          # while /opt/zufc itself (mode 700) keeps other users on the server out.
+          # while /opt/ufc-zaq itself (mode 700) keeps other users on the server out.
           pw=$APP_PASSWORD
           while [[ $pw == *[$'\r\n'] ]]; do pw=${pw%?}; done
           printf '%s\n' "$pw" | ssh -F "$SSH_CONFIG" server \
-            'cd /opt/zufc && umask 077 && cat > .app_password.new && chmod 644 .app_password.new && mv -f .app_password.new app_password'
+            'cd /opt/ufc-zaq && umask 077 && cat > .app_password.new && chmod 644 .app_password.new && mv -f .app_password.new app_password'
 
       - name: Log in to ghcr.io on the server
         id: login
@@ -352,7 +364,7 @@ jobs:
       - name: Deploy
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          remote="cd /opt/zufc &&"
+          remote="cd /opt/ufc-zaq &&"
           for name in DOMAIN APP_NAME TIMEZONE PLAYERS SESSION_DAYS; do
             remote+=" $name=$(printf %q "${!name}")"
           done
@@ -384,10 +396,8 @@ jobs:
                   echo "TCP $port: not reachable"
                 fi
               done
-              echo "zufc and the last log lines of the server's Caddy (the container publishing port 443):"
-              ssh -F "$SSH_CONFIG" server 'cd /opt/zufc && docker compose ps
-                caddy=$(docker ps --filter publish=443 --format "{{.Names}}" | head -n 1)
-                [ -n "$caddy" ] && docker logs --tail 40 "$caddy" 2>&1' || true
+              echo "Containers and the last Caddy log lines:"
+              ssh -F "$SSH_CONFIG" server 'cd /opt/ufc-zaq && docker compose ps && docker compose logs --no-color --tail 40 caddy' || true
               exit 1
             fi
             sleep 5

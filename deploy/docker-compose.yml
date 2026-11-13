@@ -1,17 +1,20 @@
-# zufc (UFC ZAQ) on the shared server, in /opt/zufc. Only the app runs here:
-# HTTPS for the domain comes from the server's existing Caddy container, which
-# reaches this app as zufc-app:3000 over the shared Docker network "edge"
-# (deploy/server-setup.sh creates it and adds the site to that Caddy).
-# Everything on "edge" is visible by its service name to every other project
-# there, so the service has a unique name: a plain "app" would hijack the other
-# stacks' "reverse_proxy app:..." routes.
-# GitHub Actions copies this file here, writes app_password (the shared login
-# password) and runs remote-deploy.sh, which writes .env: APP_IMAGE and the
-# optional APP_NAME, TIMEZONE, PLAYERS, SESSION_DAYS.
-name: zufc
+# Production stack on the VPS, in /opt/ufc-zaq: the app plus Caddy, which gets
+# and renews the HTTPS certificate for DOMAIN on its own. GitHub Actions copies
+# this file there with Caddyfile and remote-deploy.sh, writes app_password (the
+# shared login password) and runs remote-deploy.sh, which writes .env: APP_IMAGE,
+# DOMAIN and the optional APP_NAME, TIMEZONE, PLAYERS, SESSION_DAYS.
+# Ports 80/443 already taken by another web server? See "Already running a web
+# server" in the README: remove the caddy service and publish the app locally.
+name: ufc-zaq
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
 
 services:
-  zufc-app:
+  app:
     image: ${APP_IMAGE:?APP_IMAGE is not set - deploy with remote-deploy.sh}
     init: true
     restart: unless-stopped
@@ -27,10 +30,7 @@ services:
       - app_password
     volumes:
       - app-data:/app/data
-    # No published ports. Only containers on "edge" (the server's Caddy) reach it,
-    # and it can't see other projects' private networks (their databases).
-    networks:
-      - edge
+    # No published ports: only Caddy reaches the app, over the compose network.
     read_only: true
     tmpfs:
       - /tmp
@@ -38,15 +38,24 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: '3'
+    logging: *logging
 
-networks:
-  edge:
-    external: true
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is not set - deploy with remote-deploy.sh}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: *logging
 
 secrets:
   app_password:
@@ -54,3 +63,5 @@ secrets:
 
 volumes:
   app-data: # the scoreboard database and its backups
+  caddy-data: # HTTPS certificates
+  caddy-config:
